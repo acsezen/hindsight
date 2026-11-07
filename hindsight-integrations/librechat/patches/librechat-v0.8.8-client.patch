@@ -1,0 +1,789 @@
+diff --git a/client/src/components/Chat/Input/ChatForm.tsx b/client/src/components/Chat/Input/ChatForm.tsx
+index 17fc2c92f..7711db382 100644
+--- a/client/src/components/Chat/Input/ChatForm.tsx
++++ b/client/src/components/Chat/Input/ChatForm.tsx
+@@ -39,6 +39,7 @@ import {
+   PendingToolApprovalButton,
+   PendingToolApprovalPanel,
+ } from '~/components/Chat/approval/Review';
++import { hindsightKind } from '~/hooks/Hindsight/useHindsightConsent';
+ import PendingManualSkillsChips from './PendingManualSkillsChips';
+ import usePastedTextEdit from '~/hooks/Files/usePastedTextEdit';
+ import useAskAnswerMode from '~/hooks/Input/useAskAnswerMode';
+@@ -69,6 +70,7 @@ import TokenUsage from './TokenUsage';
+ import StopButton from './StopButton';
+ import SendButton from './SendButton';
+ import EditBadges from './EditBadges';
++import Hindsight from './Hindsight';
+ import BadgeRow from './BadgeRow';
+ import Mention from './Mention';
+ import store from '~/store';
+@@ -876,6 +878,15 @@ const ChatForm = memo(function ChatForm({
+                     Array.isArray(conversation?.messages) && conversation.messages.length >= 1
+                   }
+                 />
++                {index === 0 && (
++                  <Hindsight
++                    conversationId={conversationId}
++                    kind={hindsightKind(endpoint)}
++                    agentId={conversation?.agent_id}
++                    hidden={hideBadgeRow}
++                    isSubmitting={isSubmitting}
++                  />
++                )}
+                 <CodeApprovalMenu
+                   conversation={conversation}
+                   addedConversation={addedConvo}
+diff --git a/client/src/components/Chat/Input/ToolsDropdown.tsx b/client/src/components/Chat/Input/ToolsDropdown.tsx
+index 64fc779bb..015dc11c6 100644
+--- a/client/src/components/Chat/Input/ToolsDropdown.tsx
++++ b/client/src/components/Chat/Input/ToolsDropdown.tsx
+@@ -1,7 +1,15 @@
+ import React, { useState, useMemo, useCallback } from 'react';
+ import * as Ariakit from '@ariakit/react';
+ import { TooltipAnchor, DropdownPopup, PinIcon, VectorIcon } from '@librechat/client';
+-import { Brain, Globe, ScrollText, Settings, Settings2, TerminalSquareIcon } from 'lucide-react';
++import {
++  Brain,
++  Globe,
++  History,
++  Settings,
++  Settings2,
++  ScrollText,
++  TerminalSquareIcon,
++} from 'lucide-react';
+ import {
+   AuthType,
+   Permissions,
+@@ -17,6 +25,7 @@ import {
+   useHasMemoryAccess,
+   useAgentCapabilities,
+ } from '~/hooks';
++import useHindsightConsent from '~/hooks/Hindsight/useHindsightConsent';
+ import ArtifactsSubMenu from '~/components/Chat/Input/ArtifactsSubMenu';
+ import MCPSubMenu from '~/components/Chat/Input/MCPSubMenu';
+ import { useGetStartupConfig } from '~/data-provider';
+@@ -73,6 +82,12 @@ const ToolsDropdown = ({ disabled }: ToolsDropdownProps) => {
+ 
+   const canUseMemory = useHasMemoryAccess();
+   const showMemory = canUseMemory && memoryEnabled && user?.personalization?.memories !== false;
++  /** The Tools menu only renders for model chats; the composer badge shows the confirmed state. */
++  const hindsight = useHindsightConsent({
++    conversationId: context?.conversationId,
++    kind: 'model',
++    hidden: false,
++  });
+ 
+   const [isPopoverActive, setIsPopoverActive] = useState(false);
+   const isDisabled = disabled ?? false;
+@@ -312,6 +327,25 @@ const ToolsDropdown = ({ disabled }: ToolsDropdownProps) => {
+     });
+   }
+ 
++  if (hindsight.shown) {
++    dropdownItems.push({
++      /** The shared hook ignores this while a change is pending or a response is generating. */
++      onClick: () => hindsight.setEnabled(!hindsight.enabled),
++      hideOnClick: false,
++      render: (props) => (
++        <div {...props} data-testid="tools-menu-hindsight">
++          <div className="flex items-center gap-2">
++            <History className="icon-md" aria-hidden="true" />
++            <span>{localize('com_ui_hindsight')}</span>
++          </div>
++          <span className="text-xs text-text-secondary" aria-live="polite">
++            {localize(hindsight.enabled ? 'com_ui_on' : 'com_ui_off')}
++          </span>
++        </div>
++      ),
++    });
++  }
++
+   if (canRunCode && codeEnabled) {
+     dropdownItems.push({
+       onClick: handleCodeInterpreterToggle,
+diff --git a/client/src/components/SidePanel/Agents/Tools/hooks.ts b/client/src/components/SidePanel/Agents/Tools/hooks.ts
+index ad7824813..1692f2323 100644
+--- a/client/src/components/SidePanel/Agents/Tools/hooks.ts
++++ b/client/src/components/SidePanel/Agents/Tools/hooks.ts
+@@ -15,7 +15,11 @@ import {
+ import type { TSkillSummary } from 'librechat-data-provider';
+ import type { AgentForm, ExtendedFile } from '~/common';
+ import type { AgentItem } from './items/types';
+-import { useVerifyAgentToolAuth, useGetAgentFiles } from '~/data-provider';
++import {
++  useGetAgentFiles,
++  useVerifyAgentToolAuth,
++  useHindsightAvailabilityQuery,
++} from '~/data-provider';
+ import { useLocalize, useHasAccess, useHasMemoryAccess } from '~/hooks';
+ import { useFileMapContext, useAgentPanelContext } from '~/Providers';
+ import { deriveSelectedItems } from './items/selectors';
+@@ -176,6 +180,7 @@ export function useAgentItems({
+     permission: Permissions.USE,
+   });
+   const showMemory = useShowMemory();
++  const showHindsight = useHindsightAvailabilityQuery().data?.available === true;
+   const webSearchUserProvided = useWebSearchUserProvided();
+   const builtinAuthMap = useBuiltinAuthMap();
+ 
+@@ -211,6 +216,7 @@ export function useAgentItems({
+           fileSearch: hasFileSearchAccess,
+         },
+         showMemory,
++        showHindsight,
+         webSearchUserProvided,
+         builtinAuthMap,
+       }),
+@@ -226,6 +232,7 @@ export function useAgentItems({
+       hasFileSearchAccess,
+       skillsPermission,
+       showMemory,
++      showHindsight,
+       webSearchUserProvided,
+       builtinAuthMap,
+     ],
+diff --git a/client/src/components/SidePanel/Agents/Tools/items/catalog.ts b/client/src/components/SidePanel/Agents/Tools/items/catalog.ts
+index 6080c9c31..a16f04909 100644
+--- a/client/src/components/SidePanel/Agents/Tools/items/catalog.ts
++++ b/client/src/components/SidePanel/Agents/Tools/items/catalog.ts
+@@ -56,6 +56,11 @@ export interface BuildCatalogInputs {
+    * `agentsConfig.capabilities` here.
+    */
+   showMemory?: boolean;
++  /**
++   * Whether this user may add Hindsight memory to agents: the deployment's
++   * Hindsight owner with Hindsight enabled (`GET /api/hindsight/availability`).
++   */
++  showHindsight?: boolean;
+   /**
+    * Whether `web_search` uses USER_PROVIDED auth (a user-managed key). Drives the
+    * cog-vs-info affordance on the web_search card/row: configurable only when a
+@@ -173,6 +178,16 @@ export function buildCatalog(inputs: BuildCatalogInputs): AgentItem[] {
+     });
+   }
+ 
++  if (inputs.showHindsight) {
++    items.push({
++      kind: 'builtin',
++      id: 'hindsight',
++      iconKey: 'hindsight',
++      name: 'com_ui_hindsight',
++      description: 'com_agents_hindsight_info',
++    });
++  }
++
+   if (inputs.permissions.mcp) {
+     for (const [name, server] of inputs.mcpServersMap) {
+       /** Consume-only servers are provided to chat by the deployment and can't
+diff --git a/client/src/components/SidePanel/Agents/Tools/items/icons.ts b/client/src/components/SidePanel/Agents/Tools/items/icons.ts
+index 0937552f3..e4b255894 100644
+--- a/client/src/components/SidePanel/Agents/Tools/items/icons.ts
++++ b/client/src/components/SidePanel/Agents/Tools/items/icons.ts
+@@ -3,6 +3,7 @@ import {
+   MessageCircleQuestion,
+   Globe,
+   Brain,
++  History,
+   Sparkles,
+   FileText,
+   FileSearch,
+@@ -50,6 +51,10 @@ const BUILTIN_ICONS: Record<string, ItemIcon> = {
+     Icon: MessageCircleQuestion,
+     colorClass: 'bg-teal-500/15 text-teal-600 dark:text-teal-300',
+   },
++  hindsight: {
++    Icon: History,
++    colorClass: 'bg-violet-500/15 text-violet-600 dark:text-violet-300',
++  },
+ };
+ 
+ const KIND_FALLBACK_ICONS: Record<AgentItem['kind'], ItemIcon> = {
+diff --git a/client/src/components/SidePanel/Agents/Tools/items/mutations.ts b/client/src/components/SidePanel/Agents/Tools/items/mutations.ts
+index b20002b00..f547a2ae4 100644
+--- a/client/src/components/SidePanel/Agents/Tools/items/mutations.ts
++++ b/client/src/components/SidePanel/Agents/Tools/items/mutations.ts
+@@ -13,9 +13,9 @@ export type TogglePatch =
+   | { type: 'action-remove'; actionId: string };
+ 
+ function builtinTogglePatch(id: string, selected: boolean): TogglePatch {
+-  if (id === 'ask_user_question') {
+-    // Native tool presented as a builtin — it has no capability field; the
+-    // toggle edits agent.tools exactly like a plugin.
++  if (id === 'ask_user_question' || id === 'hindsight') {
++    // Native tools presented as builtins — no capability field; the toggle
++    // edits agent.tools exactly like a plugin.
+     return selected ? { type: 'tool-remove', id } : { type: 'tool-add', id };
+   }
+   // Every other BuiltinId string equals its AgentCapabilities enum value, so
+diff --git a/client/src/components/SidePanel/Agents/Tools/items/selectors.ts b/client/src/components/SidePanel/Agents/Tools/items/selectors.ts
+index 9169bc981..da7472f3b 100644
+--- a/client/src/components/SidePanel/Agents/Tools/items/selectors.ts
++++ b/client/src/components/SidePanel/Agents/Tools/items/selectors.ts
+@@ -51,8 +51,9 @@ function isBuiltinSelected(item: AgentItem, form: FormSelection): boolean {
+     case 'context':
+       return form.context_files.length > 0;
+     case 'ask_user_question':
+-      // Native tool presented as a builtin — selection lives in agent.tools.
+-      return form.tools.includes('ask_user_question');
++    case 'hindsight':
++      // Native tools presented as builtins — selection lives in agent.tools.
++      return form.tools.includes(item.id);
+     default:
+       return false;
+   }
+diff --git a/client/src/components/SidePanel/Agents/Tools/items/types.ts b/client/src/components/SidePanel/Agents/Tools/items/types.ts
+index d3c563bb0..562435989 100644
+--- a/client/src/components/SidePanel/Agents/Tools/items/types.ts
++++ b/client/src/components/SidePanel/Agents/Tools/items/types.ts
+@@ -21,7 +21,12 @@ export type BuiltinId =
+    * toggling ride `agent.tools` exactly like a plugin — see the special cases
+    * in `selectors.ts` / `mutations.ts`.
+    */
+-  | 'ask_user_question';
++  | 'ask_user_question'
++  /**
++   * Hindsight memory, the same native-tool shape: an `agent.tools` entry that
++   * makes the agent eligible; each chat still starts Off until switched On.
++   */
++  | 'hindsight';
+ 
+ export type AgentItemStatus = 'needs_setup';
+ 
+diff --git a/client/src/data-provider/index.ts b/client/src/data-provider/index.ts
+index b554ae0de..e8e17f77c 100644
+--- a/client/src/data-provider/index.ts
++++ b/client/src/data-provider/index.ts
+@@ -19,6 +19,7 @@ export * from './Traces';
+ export * from './connection';
+ export * from './Favorites';
+ export * from './CodeEnvironments';
++export * from './Hindsight';
+ export * from './mutations';
+ export * from './prompts';
+ export * from './queries';
+diff --git a/client/src/hooks/Chat/useChatFunctions.ts b/client/src/hooks/Chat/useChatFunctions.ts
+index 18bb4fa29..e33e318a0 100644
+--- a/client/src/hooks/Chat/useChatFunctions.ts
++++ b/client/src/hooks/Chat/useChatFunctions.ts
+@@ -38,6 +38,7 @@ import {
+   stripStreamedIndexStamps,
+ } from '~/utils';
+ import useFocusRegeneratedResponse from '~/hooks/Chat/useFocusRegeneratedResponse';
++import { startupConfigKey, isHindsightAcknowledged } from '~/data-provider';
+ import useGetConversation from '~/hooks/Conversations/useGetConversation';
+ import { withSubmittedCodeDecision } from '~/hooks/Agents/codeDecision';
+ import useCodeApprovalMode from '~/hooks/Agents/useCodeApprovalMode';
+@@ -46,7 +47,6 @@ import useCodeWorkspace from '~/hooks/Agents/useCodeWorkspace';
+ import useGetSender from '~/hooks/Conversations/useGetSender';
+ import { revealedQueuedTurnFamily } from '~/store/steer';
+ import store, { useGetEphemeralAgent } from '~/store';
+-import { startupConfigKey } from '~/data-provider';
+ import useUserKey from '~/hooks/Input/useUserKey';
+ import { useAuthContext } from '~/hooks';
+ 
+@@ -412,6 +412,12 @@ export default function useChatFunctions({
+     setShowStopButton(false);
+ 
+     const ephemeralAgent = getEphemeralAgent(conversationId ?? Constants.NEW_CONVO);
++    /** Sent only when the rendered Hindsight control shows On and no change is in flight. */
++    const hindsightMemory = isHindsightAcknowledged(
++      jotaiStore,
++      queryClient,
++      conversationId ?? Constants.NEW_CONVO,
++    );
+     /**
+      * Manual skill selection resolution:
+      *  - Explicit `overrideManualSkills` wins (regenerate / save-and-submit
+@@ -769,6 +775,7 @@ export default function useChatFunctions({
+       initialResponse,
+       isTemporary,
+       ephemeralAgent,
++      hindsightMemory,
+       editedContent,
+       editPrefixLength,
+       addedConvo,
+diff --git a/client/src/hooks/useNewConvo.ts b/client/src/hooks/useNewConvo.ts
+index 8424dd295..608bf68f3 100644
+--- a/client/src/hooks/useNewConvo.ts
++++ b/client/src/hooks/useNewConvo.ts
+@@ -1,4 +1,5 @@
+ import { useCallback } from 'react';
++import { useSetAtom } from 'jotai';
+ import { useNavigate, useSearchParams } from 'react-router-dom';
+ import { useGetModelsQuery } from 'librechat-data-provider/react-query';
+ import { useRecoilState, useRecoilValue, useSetRecoilState, useRecoilCallback } from 'recoil';
+@@ -51,6 +52,7 @@ import { supersedeNavigation } from './Conversations/useNavigateToConvo';
+ import useGetConversation from './Conversations/useGetConversation';
+ import useAssistantListMap from './Assistants/useAssistantListMap';
+ import { clearUploadRecovery } from './Files/useFileHandling';
++import { hindsightDraftAtom } from '~/store/hindsight';
+ import { useResetChatBadges } from './useChatBadges';
+ import { useApplyModelSpecEffects } from './Agents';
+ import { useAgentsMapContext } from '~/Providers';
+@@ -84,6 +86,7 @@ const useNewConvo = (index = 0) => {
+   const [files, setFiles] = useRecoilState(store.filesByIndex(index));
+   const saveBadgesState = useRecoilValue<boolean>(store.saveBadgesState);
+   const setSubmission = useSetRecoilState<TSubmission | null>(store.submissionByIndex(index));
++  const setHindsightDraft = useSetAtom(hindsightDraftAtom);
+   const { data: endpointsConfig = {} as TEndpointsConfig } = useGetEndpointsQuery();
+   const agentsMap = useAgentsMapContext();
+ 
+@@ -348,6 +351,8 @@ const useNewConvo = (index = 0) => {
+           !nextConversationId.startsWith('_'));
+       if (!keepsExistingDraft) {
+         renewNewConversationDraftToken(index);
++        /** Every new chat starts with Hindsight Off; a draft never carries over. */
++        setHindsightDraft(false);
+       }
+       pauseGlobalAudio();
+       if (!saveBadgesState) {
+@@ -537,6 +542,7 @@ const useNewConvo = (index = 0) => {
+       endpointsConfig,
+       getConversation,
+       pauseGlobalAudio,
++      setHindsightDraft,
+       switchToConversation,
+       applyModelSpecEffects,
+     ],
+diff --git a/client/src/locales/en/translation.json b/client/src/locales/en/translation.json
+index 2d81936fa..cde722aa4 100644
+--- a/client/src/locales/en/translation.json
++++ b/client/src/locales/en/translation.json
+@@ -196,6 +196,7 @@
+   "com_agents_file_context_label": "File Context",
+   "com_agents_file_search_disabled": "Agent must be created before uploading files for File Search.",
+   "com_agents_file_search_info": "Turns uploaded files into a searchable knowledge base. The agent retrieves the most relevant passages on demand, so it works well even with large document sets.",
++  "com_agents_hindsight_info": "Lets this agent use your private Hindsight memory in chats where you switch Hindsight on. Every chat starts with it off.",
+   "com_agents_grid_announcement": "Showing {{count}} agents in {{category}} category",
+   "com_agents_instructions_placeholder": "The system instructions that the agent uses",
+   "com_agents_link_copied": "Link copied",
+@@ -1843,6 +1844,8 @@
+   "com_ui_memories_partition_filter": "Filter memories by agent",
+   "com_ui_memories_personal": "Personal",
+   "com_ui_memory": "Memory",
++  "com_ui_hindsight": "Hindsight",
++  "com_ui_hindsight_update_error": "Could not change Hindsight memory for this chat. Showing the saved setting.",
+   "com_ui_memory_agent_badge": "Agent-scoped memory",
+   "com_ui_memory_already_exceeded": "Memory storage already full - exceeded by {{tokens}} tokens. Delete existing memories before adding new ones.",
+   "com_ui_memory_created": "Memory created successfully",
+diff --git a/packages/data-provider/src/api-endpoints.ts b/packages/data-provider/src/api-endpoints.ts
+index bee6c01ba..2cd410450 100644
+--- a/packages/data-provider/src/api-endpoints.ts
++++ b/packages/data-provider/src/api-endpoints.ts
+@@ -49,6 +49,9 @@ export const balance = () => `${BASE_URL}/api/balance`;
+ export const userPlugins = () => `${BASE_URL}/api/user/plugins`;
+ 
+ export const deleteUser = () => `${BASE_URL}/api/user/delete`;
++export const hindsightAvailability = () => `${BASE_URL}/api/hindsight/availability`;
++export const hindsightConsent = (conversationId: string) =>
++  `${BASE_URL}/api/hindsight/consent/${encodeURIComponent(conversationId)}`;
+ export const codeEnvironments = () => `${BASE_URL}/api/code-environments`;
+ export const codeEnvironmentPairings = () => `${codeEnvironments()}/pairings`;
+ export const codeEnvironmentById = (id: string) =>
+diff --git a/packages/data-provider/src/createPayload.ts b/packages/data-provider/src/createPayload.ts
+index 6d080df24..f2c836e6f 100644
+--- a/packages/data-provider/src/createPayload.ts
++++ b/packages/data-provider/src/createPayload.ts
+@@ -23,6 +23,7 @@ export default function createPayload(submission: t.TSubmission) {
+     conversation,
+     editedContent,
+     ephemeralAgent,
++    hindsightMemory,
+     endpointOption,
+     manualSkills,
+     codeApprovalMode,
+@@ -62,6 +63,7 @@ export default function createPayload(submission: t.TSubmission) {
+     conversationId,
+     isContinued: !!(isEdited && isContinued),
+     ephemeralAgent: s.isAssistantsEndpoint(endpoint) ? undefined : ephemeralAgent,
++    hindsightMemory: s.isAssistantsEndpoint(endpoint) ? undefined : hindsightMemory,
+     manualSkills: s.isAssistantsEndpoint(endpoint) ? undefined : manualSkills,
+     codeApprovalMode: s.isAssistantsEndpoint(endpoint) ? undefined : codeApprovalMode,
+     codeEnvironmentMode: s.isAssistantsEndpoint(endpoint) ? undefined : codeEnvironmentMode,
+diff --git a/packages/data-provider/src/data-service.ts b/packages/data-provider/src/data-service.ts
+index bfc7bea79..2b54de908 100644
+--- a/packages/data-provider/src/data-service.ts
++++ b/packages/data-provider/src/data-service.ts
+@@ -1587,6 +1587,22 @@ export function verifyTwoFactorTemp(
+   return request.post(endpoints.verifyTwoFactorTemp(), payload);
+ }
+ 
++/* Hindsight per-conversation memory */
++export const getHindsightAvailability = (): Promise<t.THindsightAvailability> => {
++  return request.get(endpoints.hindsightAvailability());
++};
++
++export const getHindsightConsent = (conversationId: string): Promise<t.THindsightConsent> => {
++  return request.get(endpoints.hindsightConsent(conversationId));
++};
++
++export const updateHindsightConsent = (
++  conversationId: string,
++  enabled: boolean,
++): Promise<t.THindsightConsentUpdate> => {
++  return request.put(endpoints.hindsightConsent(conversationId), { enabled });
++};
++
+ /* Memories */
+ export const getMemories = (): Promise<q.MemoriesResponse> => {
+   return request.get(endpoints.memories());
+diff --git a/packages/data-provider/src/keys.ts b/packages/data-provider/src/keys.ts
+index 5e1e72880..3624276de 100644
+--- a/packages/data-provider/src/keys.ts
++++ b/packages/data-provider/src/keys.ts
+@@ -100,6 +100,9 @@ export enum QueryKeys {
+   subagentThread = 'subagentThread',
+   backgroundTasks = 'backgroundTasks',
+   codeEnvironments = 'codeEnvironments',
++  /* Hindsight per-conversation memory */
++  hindsightAvailability = 'hindsightAvailability',
++  hindsightConsent = 'hindsightConsent',
+   agentQueuedTurns = 'agentQueuedTurns',
+   /* Combined Pinned-section display order (favorites + pinned chats) */
+   pinnedOrder = 'pinnedOrder',
+@@ -113,6 +116,7 @@ export const DynamicQueryKeys = {
+ 
+ export enum MutationKeys {
+   subagentControl = 'subagentControl',
++  updateHindsightConsent = 'updateHindsightConsent',
+   cancelBackgroundTasks = 'cancelBackgroundTasks',
+   enqueueAgentQueuedTurn = 'enqueueAgentQueuedTurn',
+   cancelAgentQueuedTurn = 'cancelAgentQueuedTurn',
+diff --git a/packages/data-provider/src/types.ts b/packages/data-provider/src/types.ts
+index 681188237..5bc712941 100644
+--- a/packages/data-provider/src/types.ts
++++ b/packages/data-provider/src/types.ts
+@@ -153,6 +153,12 @@ export type TPayload = Partial<TMessage> &
+     messages?: TMessages;
+     isTemporary: boolean;
+     ephemeralAgent?: TEphemeralAgent | null;
++    /**
++     * True only when this page displayed Hindsight memory as On for the chat
++     * (server-confirmed, or the new chat's own choice). The server can only
++     * narrow consent with it, never widen it.
++     */
++    hindsightMemory?: boolean;
+     editedContent?: TEditedContent | null;
+     /** Added conversation for multi-convo feature */
+     addedConvo?: TConversation;
+@@ -217,6 +223,8 @@ export type TSubmission = {
+   endpointOption: TEndpointOption;
+   clientTimestamp?: string;
+   ephemeralAgent?: TEphemeralAgent | null;
++  /** See `TPayload.hindsightMemory`. */
++  hindsightMemory?: boolean;
+   editedContent?: TEditedContent | null;
+   /**
+    * Length of the retained content prefix for an edited resubmission, captured
+@@ -1100,3 +1108,8 @@ export type TLangfuseSessionLinkResponse = {
+   /** Opaque identity of the project `url` opens, so a caller can tell whether it holds what it showed. */
+   destinationId?: string;
+ };
++
++/** Hindsight per-conversation memory: the owner's availability and a chat's consent. */
++export type THindsightAvailability = { available: boolean };
++export type THindsightConsent = { available: boolean; enabled: boolean };
++export type THindsightConsentUpdate = { enabled: boolean };
+diff --git a/client/src/components/Chat/Input/Hindsight.tsx b/client/src/components/Chat/Input/Hindsight.tsx
+new file mode 100644
+index 000000000..286d6d75e
+--- /dev/null
++++ b/client/src/components/Chat/Input/Hindsight.tsx
+@@ -0,0 +1,65 @@
++import React, { memo, useEffect } from 'react';
++import { useSetAtom } from 'jotai';
++import { History } from 'lucide-react';
++import { composerControlClasses } from '@librechat/client';
++import type { HindsightSurface } from '~/hooks/Hindsight/useHindsightConsent';
++import useHindsightConsent from '~/hooks/Hindsight/useHindsightConsent';
++import { hindsightAcknowledgedAtom } from '~/store/hindsight';
++import { badgeAccents } from './accents';
++import { useLocalize } from '~/hooks';
++import { cn } from '~/utils';
++
++interface HindsightProps extends HindsightSurface {
++  isSubmitting: boolean;
++}
++
++/**
++ * Per-chat Hindsight memory switch. Model chats switch it from the Tools menu
++ * and show it while On; saved-agent chats have no Tools menu, so there it is
++ * always shown. A plain switch rather than `CheckboxButton`, whose internal
++ * store flips on click before the server confirms the change. Only this
++ * rendered control can confirm On for a submission.
++ */
++function Hindsight({ isSubmitting, ...surface }: HindsightProps) {
++  const localize = useLocalize();
++  const setAcknowledged = useSetAtom(hindsightAcknowledgedAtom);
++  const { key, shown, enabled, pending, unconfirmed, setEnabled } = useHindsightConsent(surface);
++  const visible = shown && (surface.kind === 'agent' || enabled || pending);
++  const acknowledged = visible && enabled && !pending;
++
++  useEffect(() => {
++    setAcknowledged(acknowledged ? key : null);
++    return () => setAcknowledged(null);
++  }, [acknowledged, key, setAcknowledged]);
++
++  if (!visible) {
++    return null;
++  }
++
++  const label = localize('com_ui_hindsight');
++  return (
++    <button
++      type="button"
++      role="switch"
++      aria-checked={enabled && !unconfirmed}
++      aria-busy={pending}
++      aria-label={label}
++      /** Still clickable after a failed read: the click asks the server again. */
++      disabled={isSubmitting || (pending && !unconfirmed)}
++      data-testid="hindsight-badge"
++      onClick={() => setEnabled(!enabled)}
++      className={cn(
++        composerControlClasses(),
++        'w-theme-control max-w-fit p-theme-compact disabled:opacity-60 md:w-full md:px-theme-normal',
++        enabled && !unconfirmed && badgeAccents.purple,
++      )}
++    >
++      <span className="icon-md text-text-primary">
++        <History className="icon-md" aria-hidden="true" />
++      </span>
++      <span className="hidden truncate md:block">{label}</span>
++    </button>
++  );
++}
++
++export default memo(Hindsight);
+diff --git a/client/src/data-provider/Hindsight.ts b/client/src/data-provider/Hindsight.ts
+new file mode 100644
+index 000000000..028b7be91
+--- /dev/null
++++ b/client/src/data-provider/Hindsight.ts
+@@ -0,0 +1,87 @@
++import { Constants, MutationKeys, QueryKeys, dataService } from 'librechat-data-provider';
++import { useIsMutating, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
++import type {
++  THindsightConsent,
++  THindsightAvailability,
++  THindsightConsentUpdate,
++} from 'librechat-data-provider';
++import type { QueryClient } from '@tanstack/react-query';
++import type { useStore } from 'jotai';
++import { hindsightAcknowledgedAtom } from '~/store/hindsight';
++
++const consentKey = (conversationId: string) => [QueryKeys.hindsightConsent, conversationId];
++const consentMutationKey = (conversationId: string) => [
++  MutationKeys.updateHindsightConsent,
++  conversationId,
++];
++
++export function useHindsightAvailabilityQuery() {
++  return useQuery<THindsightAvailability>(
++    [QueryKeys.hindsightAvailability],
++    () => dataService.getHindsightAvailability(),
++    { staleTime: Infinity, refetchOnWindowFocus: false },
++  );
++}
++
++export function useHindsightConsentQuery(conversationId: string, enabled: boolean) {
++  return useQuery<THindsightConsent>(
++    consentKey(conversationId),
++    () => dataService.getHindsightConsent(conversationId),
++    { enabled: enabled && conversationId.length > 0, refetchOnWindowFocus: false },
++  );
++}
++
++/**
++ * The displayed state changes only from a server answer. Success cancels any
++ * read already in flight (an older answer must not overwrite the confirmed
++ * one) before writing it; failure refetches server truth. Both callbacks are
++ * awaited by the mutation, so it stays pending until reconciliation is done.
++ */
++export function useUpdateHindsightConsentMutation(conversationId: string) {
++  const queryClient = useQueryClient();
++  const queryKey = consentKey(conversationId);
++  return useMutation<THindsightConsentUpdate, unknown, boolean>(
++    consentMutationKey(conversationId),
++    (enabled) => dataService.updateHindsightConsent(conversationId, enabled),
++    {
++      onSuccess: async (data) => {
++        await queryClient.cancelQueries({ queryKey });
++        queryClient.setQueryData<THindsightConsent>(queryKey, {
++          available: true,
++          enabled: data.enabled,
++        });
++      },
++      onError: () => queryClient.invalidateQueries({ queryKey }),
++    },
++  );
++}
++
++/** True while any control's change for this chat is unconfirmed or reconciling. */
++export function useHindsightConsentChanging(conversationId: string): boolean {
++  return useIsMutating({ mutationKey: consentMutationKey(conversationId) }) > 0;
++}
++
++/**
++ * The send-time check: a rendered control showed On for this chat, no change
++ * from any control is still in flight, and, for an existing chat, the cached
++ * state is a successful, current server answer. A failed or invalidated read
++ * never counts, even when an older On is still cached. Read synchronously
++ * from the stores, so a send cannot slip in before the badge re-renders.
++ */
++export function isHindsightAcknowledged(
++  jotai: ReturnType<typeof useStore>,
++  queryClient: QueryClient,
++  conversationId: string,
++): boolean {
++  if (jotai.get(hindsightAcknowledgedAtom) !== conversationId) {
++    return false;
++  }
++  if (queryClient.isMutating({ mutationKey: consentMutationKey(conversationId) }) > 0) {
++    return false;
++  }
++  if (conversationId === Constants.NEW_CONVO) {
++    return true;
++  }
++  const state = queryClient.getQueryState(consentKey(conversationId));
++  return state?.status === 'success' && !state.isInvalidated;
++}
+diff --git a/client/src/hooks/Hindsight/useHindsightConsent.ts b/client/src/hooks/Hindsight/useHindsightConsent.ts
+new file mode 100644
+index 000000000..4354256df
+--- /dev/null
++++ b/client/src/hooks/Hindsight/useHindsightConsent.ts
+@@ -0,0 +1,112 @@
++import { useCallback } from 'react';
++import { useAtom } from 'jotai';
++import { useRecoilValue } from 'recoil';
++import { useToastContext } from '@librechat/client';
++import { Constants, isAgentsEndpoint, isAssistantsEndpoint } from 'librechat-data-provider';
++import {
++  useGetAgentByIdQuery,
++  useHindsightConsentQuery,
++  useHindsightConsentChanging,
++  useHindsightAvailabilityQuery,
++  useUpdateHindsightConsentMutation,
++} from '~/data-provider';
++import { hindsightDraftAtom } from '~/store/hindsight';
++import { useLocalize } from '~/hooks';
++import store from '~/store';
++
++/** The Tool Library entry that makes a saved agent Hindsight-capable. */
++const HINDSIGHT_TOOL = 'hindsight';
++
++/** Which composer surface an endpoint is: saved agents, plain model chats, or unsupported. */
++export function hindsightKind(endpoint?: string | null): HindsightSurface['kind'] {
++  if (!endpoint || isAssistantsEndpoint(endpoint)) {
++    return null;
++  }
++  return isAgentsEndpoint(endpoint) ? 'agent' : 'model';
++}
++
++export interface HindsightSurface {
++  conversationId?: string | null;
++  /** `model` for plain model chats, `agent` for saved agents, null where unsupported. */
++  kind: 'model' | 'agent' | null;
++  agentId?: string | null;
++  /** Model specs that hide the badge row never show the control. */
++  hidden: boolean;
++}
++
++/**
++ * Per-chat Hindsight state for the composer. Existing chats show only the
++ * server-confirmed value; a new chat holds its own in-memory draft until its
++ * first message. The server makes the final decision either way.
++ */
++export default function useHindsightConsent({
++  conversationId,
++  kind,
++  agentId,
++  hidden,
++}: HindsightSurface) {
++  const localize = useLocalize();
++  const { showToast } = useToastContext();
++  const isTemporary = useRecoilValue(store.isTemporary);
++  const isSubmitting = useRecoilValue(store.anySubmittingSelector);
++  const key = conversationId || Constants.NEW_CONVO;
++  const isNew = key === Constants.NEW_CONVO;
++  const availability = useHindsightAvailabilityQuery();
++  const available = availability.data?.available === true;
++  const eligible = available && kind != null && !hidden && !isTemporary;
++  const agent = useGetAgentByIdQuery(agentId, {
++    enabled: eligible && kind === 'agent' && !!agentId,
++  });
++  const capable = kind === 'agent' ? agent.data?.tools?.includes(HINDSIGHT_TOOL) === true : true;
++  const supported = eligible && capable;
++  const consent = useHindsightConsentQuery(key, supported && !isNew);
++  const mutation = useUpdateHindsightConsentMutation(key);
++  /** Shared by every control: a change started from the Tools menu also holds the badge. */
++  const changing = useHindsightConsentChanging(key);
++  const [draft, setDraft] = useAtom(hindsightDraftAtom);
++
++  const shown = supported && (isNew || consent.data?.available === true);
++  const enabled = isNew ? draft : consent.data?.enabled === true;
++  /** A failed read leaves only an older cached answer: never treat it as confirmed. */
++  const unconfirmed = !isNew && consent.isError;
++  const pending = !isNew && (changing || consent.data == null || unconfirmed);
++
++  const setEnabled = useCallback(
++    (value: boolean) => {
++      /** The server refuses changes during a run; the controls do not offer one. */
++      if (isSubmitting) {
++        return;
++      }
++      /** After a failed read, a click asks the server again instead of changing anything. */
++      if (unconfirmed && !changing) {
++        void consent.refetch();
++        return;
++      }
++      if (pending) {
++        return;
++      }
++      if (isNew) {
++        setDraft(value);
++        return;
++      }
++      mutation.mutate(value, {
++        onError: () =>
++          showToast({ message: localize('com_ui_hindsight_update_error'), status: 'error' }),
++      });
++    },
++    [
++      isNew,
++      consent,
++      pending,
++      changing,
++      mutation,
++      setDraft,
++      localize,
++      showToast,
++      unconfirmed,
++      isSubmitting,
++    ],
++  );
++
++  return { key, shown, enabled, pending, unconfirmed, isSubmitting, setEnabled };
++}
+diff --git a/client/src/store/hindsight.ts b/client/src/store/hindsight.ts
+new file mode 100644
+index 000000000..9522180cd
+--- /dev/null
++++ b/client/src/store/hindsight.ts
+@@ -0,0 +1,14 @@
++import { atom } from 'jotai';
++
++/**
++ * A new chat's own Hindsight choice before its first message. In memory only:
++ * never persisted, and reset on every conversation switch so new chats never
++ * inherit it.
++ */
++export const hindsightDraftAtom = atom(false);
++
++/**
++ * The conversation whose rendered Hindsight control currently shows On, if
++ * any. Submissions send `hindsightMemory: true` only for that conversation.
++ */
++export const hindsightAcknowledgedAtom = atom<string | null>(null);

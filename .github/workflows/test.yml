@@ -54,6 +54,7 @@ jobs:
       integrations-autogen: ${{ steps.filter.outputs.integrations-autogen }}
       integrations-aider: ${{ steps.filter.outputs.integrations-aider }}
       integrations-langgraph: ${{ steps.filter.outputs.integrations-langgraph }}
+      integrations-librechat: ${{ steps.filter.outputs.integrations-librechat }}
       integrations-llamaindex: ${{ steps.filter.outputs.integrations-llamaindex }}
       integrations-paperclip: ${{ steps.filter.outputs.integrations-paperclip }}
       integrations-eve: ${{ steps.filter.outputs.integrations-eve }}
@@ -220,6 +221,8 @@ jobs:
             - 'hindsight-integrations/aider/**'
           integrations-langgraph:
             - 'hindsight-integrations/langgraph/**'
+          integrations-librechat:
+            - 'hindsight-integrations/librechat/**'
           integrations-llamaindex:
             - 'hindsight-integrations/llamaindex/**'
           integrations-haystack:
@@ -757,6 +760,50 @@ jobs:
     - name: Validate Agent Plugin manifests
       working-directory: ./hindsight-integrations/agent-plugin
       run: python3 validate.py
+
+  # Tests the @vectorize-io/hindsight-librechat package standalone (typecheck,
+  # unit/lifecycle tests, build). It does not launch LibreChat: exact-host
+  # regression checks and running-container/live acceptance are separate.
+  test-librechat-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-librechat == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: '22'
+
+    # Lockfile registry-resolution is covered by the dedicated
+    # check-integration-lockfiles job (filter: hindsight-integrations/*/package-lock.json).
+    - name: Install dependencies
+      working-directory: ./hindsight-integrations/librechat
+      run: npm ci
+
+    - name: Typecheck
+      working-directory: ./hindsight-integrations/librechat
+      run: npm run typecheck
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/librechat
+      run: npm test
+
+    - name: Build
+      working-directory: ./hindsight-integrations/librechat
+      run: npm run build
+
+    - name: Check formatting
+      working-directory: ./hindsight-integrations/librechat
+      run: npm run lint
 
   build-ai-sdk-integration:
     needs: [detect-changes]
@@ -5652,6 +5699,7 @@ jobs:
       - test-langgraph-integration
       - test-superagent-integration
       - test-litellm-integration
+      - test-librechat-integration
       - test-pydantic-ai-integration
       - test-hermes-integration
       - test-llamaindex-integration

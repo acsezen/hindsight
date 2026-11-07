@@ -1,0 +1,65 @@
+{
+  "name": "@vectorize-io/hindsight-librechat",
+  "version": "0.1.0",
+  "description": "Native LibreChat memory lifecycle adapter for Hindsight",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "hindsight-librechat": "dist/install.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./loader": {
+      "types": "./dist/loader.d.ts",
+      "import": "./dist/loader.js",
+      "require": "./dist/loader.cjs"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js",
+      "require": "./dist/config.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "patches",
+    "deploy"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vectorize-io/hindsight.git",
+    "directory": "hindsight-integrations/librechat"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsup && tsup --config tsup.install.config.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "lint": "prettier --check .",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@vectorize-io/hindsight-client": "1.2.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@librechat/agents": "4.0.1",
+    "@types/node": "^22.0.0",
+    "mongodb": "6.20.0",
+    "mongodb-memory-server": "11.0.1",
+    "prettier": "3.7.4",
+    "tsup": "^8.5.1",
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.12"
+  }
+}

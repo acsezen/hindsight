@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "librechatVersion": "v0.8.8",
+  "frameworkVersion": "4.0.1",
+  "files": [
+    {
+      "path": "api/server/controllers/agents/client.js",
+      "beforeSha256": "9b2f6accf56544096aa530d5bccff4b1cc5b76651a746da2a8aee94cc20020e1",
+      "afterSha256": "9a4fa29b0f8f129bbbafaae0a46ff817b8379217f2e5c0e6baa71287c72a09e0",
+      "edits": [
+        {
+          "oldText": "const { getMCPManager } = require('~/config');\nconst db = require('~/models');\n\nconst loadAgent = (params) =>\n",
+          "newText": "const { getMCPManager } = require('~/config');\nconst db = require('~/models');\nconst hindsightMemory = require('~/server/services/HindsightMemory');\nconst { DynamicStructuredTool } = require('@librechat/agents/langchain/tools');\n\nconst loadAgent = (params) =>\n"
+        },
+        {
+          "oldText": "      return undefined;\n    }\n    if (isMemoryAgentEnabled(this.options.req.config?.memory)) {\n      return undefined;\n    }\n",
+          "newText": "      return undefined;\n    }\n    if (\n      isMemoryAgentEnabled(this.options.req.config?.memory) ||\n      hindsightMemory.requiresFreshRun(\n        this.options.req.config?.config?.hindsight,\n        this.options.req.user,\n      )\n    ) {\n      return undefined;\n    }\n"
+        },
+        {
+          "oldText": "      this.getSharedMemoryContext(),\n      resolveConfigServers(this.options.req),\n    ]);\n    void earlySharedContextPromise.catch(() => {});\n",
+          "newText": "      this.getSharedMemoryContext(),\n      resolveConfigServers(this.options.req),\n      this.getHindsightMemoryContext(orderedMessages),\n    ]);\n    void earlySharedContextPromise.catch(() => {});\n"
+        },
+        {
+          "oldText": "     */\n    const sharedRunContextParts = [];\n    const [augmentedPrompt, [memories, configServers], agentScopedContext] = await Promise.all([\n      this.contextHandlers?.createContext(),\n      earlySharedContextPromise,\n      agentScopedContextPromise,\n    ]);\n\n    this.retainedAnswers = await retainedAnswersPromise;\n    promptTokens += this.retainedAnswers.tokenCount;\n",
+          "newText": "     */\n    const sharedRunContextParts = [];\n    const [augmentedPrompt, [memories, configServers, hindsightContext], agentScopedContext] =\n      await Promise.all([\n        this.contextHandlers?.createContext(),\n        earlySharedContextPromise,\n        agentScopedContextPromise,\n      ]);\n\n    hindsightMemory.attachTools(\n      this.options.req,\n      allAgents.map(({ agent }) => agent),\n      (definition) => new DynamicStructuredTool(definition),\n      (text) =>\n        assertModelBoundContent({\n          onTraversalFailure: reportLocatorTraversalFailure,\n          filters: this.options.req.config?.filters,\n          legacyPii: this.options.req.config?.messageFilter?.pii,\n          memories: [text],\n        }),\n      this.options.req.config?.endpoints?.agents?.capabilities?.includes(AgentCapabilities.tools),\n    );\n    this.retainedAnswers = await retainedAnswersPromise;\n    promptTokens += this.retainedAnswers.tokenCount;\n"
+        },
+        {
+          "oldText": "        }\n      }\n      if (scopedContext) {\n        modelBoundFileContexts.add(scopedContext);\n",
+          "newText": "        }\n      }\n      hindsightMemory.appendAgentContext(\n        this.options.req,\n        agent,\n        hindsightContext,\n        agentRunContextParts,\n        modelBoundMemoryContexts,\n        agentMemoryContexts,\n      );\n      if (scopedContext) {\n        modelBoundFileContexts.add(scopedContext);\n"
+        },
+        {
+          "oldText": "  }\n\n  /** Reuses the exact memory authorization/load promise for planning and prompt construction. */\n  getSharedMemoryContext() {\n",
+          "newText": "  }\n\n  getHindsightMemoryContext(messages = this.currentMessages) {\n    return hindsightMemory.prepare({\n      request: this.options.req,\n      config: this.options.req.config?.config?.hindsight,\n      user: this.options.req.user,\n      query: this.options.req.body?.text,\n      messages,\n      leafId: this.parentMessageId,\n      temporary: hindsightMemory.temporary(this.options.req),\n      compaction: this.isCompactionTurn?.() === true,\n      signal: this.abortController?.signal,\n    });\n  }\n\n  /** Reuses the exact memory authorization/load promise for planning and prompt construction. */\n  getSharedMemoryContext() {\n"
+        },
+        {
+          "oldText": "   */\n  async getEventActorMemorySnapshots(agents) {\n    const primary = await this.getSharedMemoryContext();\n    if (!primary) {\n      return [];\n    }\n    const userId = this.options.req.user.id + '';\n",
+          "newText": "   */\n  async getEventActorMemorySnapshots(agents) {\n    const [primary, hindsight] = await Promise.all([\n      this.getSharedMemoryContext(),\n      this.getHindsightMemoryContext(),\n    ]);\n    if (!primary) {\n      return hindsightMemory.snapshots(hindsight, []);\n    }\n    const userId = this.options.req.user.id + '';\n"
+        },
+        {
+          "oldText": "      }),\n    );\n    return [...scopes]\n      .map(([scope, snapshot]) => ({\n        scope: scope || 'shared',\n        ...(snapshot.withKeys ? { withKeys: snapshot.withKeys } : {}),\n        ...(snapshot.withoutKeys ? { withoutKeys: snapshot.withoutKeys } : {}),\n      }))\n      .sort((left, right) => left.scope.localeCompare(right.scope));\n  }\n\n",
+          "newText": "      }),\n    );\n    return hindsightMemory.snapshots(\n      hindsight,\n      [...scopes]\n        .map(([scope, snapshot]) => ({\n          scope: scope || 'shared',\n          ...(snapshot.withKeys ? { withKeys: snapshot.withKeys } : {}),\n          ...(snapshot.withoutKeys ? { withoutKeys: snapshot.withoutKeys } : {}),\n        }))\n        .sort((left, right) => left.scope.localeCompare(right.scope)),\n    );\n  }\n\n"
+        }
+      ]
+    },
+    {
+      "path": "api/server/controllers/agents/request.js",
+      "beforeSha256": "3ca1d4f69dc76b00410fb60f84a70f26514c935b3f705292d595091c41c2ab93",
+      "afterSha256": "93c848de0ccf0eef41cba7b54d2712dcaea43469e6f4abd09a0adda9f04aa8cd",
+      "edits": [
+        {
+          "oldText": "const { logger, tenantStorage, createChatExpirationDate } = require('@librechat/data-schemas');\nconst { v5: uuidv5 } = require('uuid');\nconst {\n",
+          "newText": "const { logger, tenantStorage, createChatExpirationDate } = require('@librechat/data-schemas');\nconst hindsightMemory = require('~/server/services/HindsightMemory');\nconst { v5: uuidv5 } = require('uuid');\nconst {\n"
+        },
+        {
+          "oldText": "    });\n\n    /** @type {{ client: TAgentClient; userMCPAuthMap?: Record<string, Record<string, string>> }} */\n    const result = await initializeClient({\n",
+          "newText": "    });\n\n    const hindsightAdmission = hindsightMemory.beginAdmission({\n      request: req,\n      config: req.config?.config?.hindsight,\n      user: req.user,\n      conversationId,\n      newConversation: isNewConvo,\n      generation: jobCreatedAt,\n      interactive: !isScheduledFire && req._isAgentTrigger !== true,\n      temporary: hindsightMemory.temporary(req),\n      acknowledged: req.body?.hindsightMemory,\n    });\n    /** @type {{ client: TAgentClient; userMCPAuthMap?: Record<string, Record<string, string>> }} */\n    const result = await initializeClient({\n"
+        },
+        {
+          "oldText": "    startupTelemetry?.mark('client_initialized');\n    client = result.client;\n    const normalizedMCPRequestBody = createMCPRuntimeRequestBody({\n      messageId: mcpRequestBody.messageId,\n",
+          "newText": "    startupTelemetry?.mark('client_initialized');\n    client = result.client;\n    await hindsightMemory.admit(hindsightAdmission, client);\n    const normalizedMCPRequestBody = createMCPRuntimeRequestBody({\n      messageId: mcpRequestBody.messageId,\n"
+        },
+        {
+          "oldText": "        );\n        logAgentMemorySnapshot('after_terminal_save', terminalMemoryContext);\n        if (appliedEventActor != null) {\n          const recorded = await recordAgentEventActorReconciliation({\n",
+          "newText": "        );\n        logAgentMemorySnapshot('after_terminal_save', terminalMemoryContext);\n        await hindsightMemory.finalize(\n          {\n            request: req,\n            config: req.config?.config?.hindsight,\n            user: req.user,\n            temporary: hindsightMemory.temporary(req),\n          },\n          userMessage,\n          savedResponseMessage,\n          { unfinished: responseIsUnfinished, compaction: client.isCompactionTurn?.() === true },\n        );\n        if (appliedEventActor != null) {\n          const recorded = await recordAgentEventActorReconciliation({\n"
+        }
+      ]
+    },
+    {
+      "path": "api/server/controllers/agents/resume.js",
+      "beforeSha256": "9c6ae6e847aa8a7defb124022fbd23c08a2876a9c45087cafc3599778f58fa1d",
+      "afterSha256": "42ef4a36d9293192835065b9480e8a551214b625843b220054791bc1eec4a507",
+      "edits": [
+        {
+          "oldText": "const { isDeepStrictEqual } = require('util');\nconst { logger } = require('@librechat/data-schemas');\nconst {\n  Constants,\n",
+          "newText": "const { isDeepStrictEqual } = require('util');\nconst { logger } = require('@librechat/data-schemas');\nconst hindsightMemory = require('~/server/services/HindsightMemory');\nconst {\n  Constants,\n"
+        },
+        {
+          "oldText": "      { userId, conversationId, client, savedResponseMessage },\n      'api/server/controllers/agents/resume.js - recovered resumed response reference',\n    );\n    if (appliedEventActor != null) {\n",
+          "newText": "      { userId, conversationId, client, savedResponseMessage },\n      'api/server/controllers/agents/resume.js - recovered resumed response reference',\n    );\n    await hindsightMemory.finalize(\n      {\n        request: req,\n        config: req.config?.config?.hindsight,\n        user: req.user,\n        temporary: isTemporary === true,\n      },\n      userMessage,\n      savedResponseMessage,\n      {\n        unfinished: responseMessage.unfinished,\n        compaction: client?.isCompactionTurn?.() === true,\n        userMetadata: true,\n      },\n    );\n    if (appliedEventActor != null) {\n"
+        },
+        {
+          "oldText": "    });\n    client = result.client;\n\n    // The user approved the code action against the route/session selected at\n",
+          "newText": "    });\n    client = result.client;\n    await hindsightMemory.restore(\n      {\n        request: req,\n        config: req.config?.config?.hindsight,\n        user: req.user,\n        conversationId: streamId,\n        generation: job.createdAt,\n        temporary: job.metadata.isTemporary === true,\n      },\n      client,\n    );\n\n    // The user approved the code action against the route/session selected at\n"
+        }
+      ]
+    },
+    {
+      "path": "api/server/controllers/agents/v1.js",
+      "beforeSha256": "c1beaf2d1826de95b46a7468fd1bc0a7f3203b56780ed6bda36f62249487817b",
+      "afterSha256": "1458fbcd4c39c6b8ce004bed89d82ba1e8d70ea8b62299caf9999c31f692c836",
+      "edits": [
+        {
+          "oldText": "const { filterFile } = require('~/server/services/Files/process');\nconst { getCachedTools } = require('~/server/services/Config');\nconst {\n  createMCPPermissionContext,\n",
+          "newText": "const { filterFile } = require('~/server/services/Files/process');\nconst { getCachedTools } = require('~/server/services/Config');\nconst { HINDSIGHT_TOOL } = require('@vectorize-io/hindsight-librechat');\nconst {\n  createMCPPermissionContext,\n"
+        },
+        {
+          "oldText": "  [Tools.web_search]: true,\n  [Tools.memory]: true,\n};\n\n",
+          "newText": "  [Tools.web_search]: true,\n  [Tools.memory]: true,\n  [HINDSIGHT_TOOL]: true,\n};\n\n"
+        }
+      ]
+    },
+    {
+      "path": "api/server/index.js",
+      "beforeSha256": "7ace779867986d2c7313cca7930486d352093a8fd2537ef919f2996dca24da57",
+      "afterSha256": "d4776d94e1d719c05a99679b34ed1cf7acfffb1bc7bee624abec3bb0656a4906",
+      "edits": [
+        {
+          "oldText": "  app.use('/api/banner', routes.banner);\n  app.use('/api/memories', routes.memories);\n  app.use('/api/schedules', rejectScheduleWritesUntilReady, routes.schedules);\n  app.use('/api/permissions', routes.accessPermissions);\n",
+          "newText": "  app.use('/api/banner', routes.banner);\n  app.use('/api/memories', routes.memories);\n  app.use('/api/hindsight', require('./routes/hindsight'));\n  app.use('/api/schedules', rejectScheduleWritesUntilReady, routes.schedules);\n  app.use('/api/permissions', routes.accessPermissions);\n"
+        }
+      ]
+    },
+    {
+      "path": "api/server/routes/hindsight.js",
+      "beforeSha256": null,
+      "afterSha256": "89c528bc0dd751faef3366b5df6fb2113a69c9fdca5ddfcd25338efce1ee321d",
+      "content": "const express = require('express');\nconst { consentHandlers } = require('@vectorize-io/hindsight-librechat');\nconst { requireJwtAuth, configMiddleware } = require('~/server/middleware');\nconst hindsightMemory = require('~/server/services/HindsightMemory');\n\nconst router = express.Router();\nconst handlers = consentHandlers(hindsightMemory);\n\nrouter.use(requireJwtAuth, configMiddleware);\nrouter.get('/availability', (req, res) => handlers.availability(req, res));\nrouter.get('/consent/:conversationId', (req, res) => handlers.read(req, res));\nrouter.put('/consent/:conversationId', (req, res) => handlers.update(req, res));\n\nmodule.exports = router;\n"
+    },
+    {
+      "path": "api/server/services/Config/loadCustomConfig.js",
+      "beforeSha256": "79ccf0d6567d793da3d205eb8ead84a93c52ea0e9b228823a7f4bac089c42ef2",
+      "afterSha256": "7aa454606bf3aee548a6a5d2e689c3c6aa7a5d00308922fb7116d012b085fc4a",
+      "edits": [
+        {
+          "oldText": "const path = require('path');\nconst { loadYaml, redactConfigSecretMaps, createCustomConfigLoader } = require('@librechat/api');\n\nconst projectRoot = path.resolve(__dirname, '..', '..', '..', '..');\nconst defaultConfigPath = path.resolve(projectRoot, 'librechat.yaml');\n\nmodule.exports = createCustomConfigLoader({\n  loadLocal: loadYaml,\n  defaultConfigPath,\n  redactConfig: redactConfigSecretMaps,\n});\n",
+          "newText": "const path = require('path');\nconst axios = require('axios');\nconst yaml = require('js-yaml');\nconst { createHindsightConfigLoader } = require('@vectorize-io/hindsight-librechat/loader');\nconst { loadYaml, redactConfigSecretMaps, createCustomConfigLoader } = require('@librechat/api');\n\nconst projectRoot = path.resolve(__dirname, '..', '..', '..', '..');\nconst defaultConfigPath = path.resolve(projectRoot, 'librechat.yaml');\n\nmodule.exports = createHindsightConfigLoader(\n  createCustomConfigLoader,\n  {\n    loadLocal: loadYaml,\n    defaultConfigPath,\n    redactConfig: redactConfigSecretMaps,\n  },\n  { remote: axios, parseYaml: yaml.load },\n);\n"
+        }
+      ]
+    },
+    {
+      "path": "api/server/services/Endpoints/agents/initialize.js",
+      "beforeSha256": "104e4c945a5e008e5ca476c033ed3115260c3c1e15aafa86eb04a9bcc2387522",
+      "afterSha256": "ab3d33923ff3bb46bd69faa0efc0b7621036dc840161a19022da160bbcf99b5e",
+      "edits": [
+        {
+          "oldText": "const { logger } = require('@librechat/data-schemas');\nconst { createContentAggregator, GraphNodeKeys } = require('@librechat/agents');\nconst {\n",
+          "newText": "const { logger } = require('@librechat/data-schemas');\nconst hindsightMemory = require('~/server/services/HindsightMemory');\nconst { createContentAggregator, GraphNodeKeys } = require('@librechat/agents');\nconst {\n"
+        },
+        {
+          "oldText": "    },\n  );\n\n  /** Price emitted usage with the primary agent's resolved endpoint config so\n",
+          "newText": "    },\n  );\n  hindsightMemory.bindAgent(req, primaryConfig, primaryAgent, isEphemeralAgentId(primaryAgent.id));\n\n  /** Price emitted usage with the primary agent's resolved endpoint config so\n"
+        },
+        {
+          "oldText": "      onAgentInitialized: (agentId, agent, config) => {\n        agentToolContexts.set(agentId, buildAgentToolContext({ agent, config }));\n      },\n      // Pass through the `@librechat/api` exports so that tests which\n",
+          "newText": "      onAgentInitialized: (agentId, agent, config) => {\n        agentToolContexts.set(agentId, buildAgentToolContext({ agent, config }));\n        hindsightMemory.bindAgent(req, config, agent);\n      },\n      // Pass through the `@librechat/api` exports so that tests which\n"
+        },
+        {
+          "oldText": "  );\n\n  const eventHandlers = getDefaultHandlers({\n    res,\n",
+          "newText": "  );\n\n  hindsightMemory.wrapToolExecution(req, toolExecuteOptions);\n  const eventHandlers = getDefaultHandlers({\n    res,\n"
+        }
+      ]
+    },
+    {
+      "path": "api/server/services/HindsightMemory.js",
+      "beforeSha256": null,
+      "afterSha256": "ee5fd6c8cdfccfdc1d2378efb7ce6623fa8dc8b290c8ade21f87eb376c684c63",
+      "content": "const mongoose = require('mongoose');\nconst { logger } = require('@librechat/data-schemas');\nconst { GenerationJobManager, registerShutdownTask } = require('@librechat/api');\nconst { LibreChatMemory } = require('@vectorize-io/hindsight-librechat');\nconst db = require('~/models');\n\nconst hindsightMemory = new LibreChatMemory(\n  (name) => process.env[name],\n  (event) => logger.warn('[hindsight-memory]', event),\n  {\n    database: () => mongoose.connection.db,\n    conversations: { get: (user, conversationId) => db.getConvo(user, conversationId) },\n    generations: GenerationJobManager,\n  },\n);\n\nregisterShutdownTask('Hindsight memory', () => hindsightMemory.close());\n\nmodule.exports = hindsightMemory;\n"
+    }
+  ]
+}

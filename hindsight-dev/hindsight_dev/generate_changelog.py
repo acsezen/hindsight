@@ -131,6 +131,7 @@ INTEGRATIONS: dict[str, IntegrationMeta] = {
     "chat": IntegrationMeta("@vectorize-io/hindsight-chat", "Chat SDK"),
     "openclaw": IntegrationMeta("@vectorize-io/hindsight-openclaw", "OpenClaw"),
     "langgraph": IntegrationMeta("hindsight-langgraph", "LangGraph"),
+    "librechat": IntegrationMeta("@vectorize-io/hindsight-librechat", "LibreChat"),
     "nemoclaw": IntegrationMeta("@vectorize-io/hindsight-nemoclaw", "NemoClaw"),
     "strands": IntegrationMeta("hindsight-strands", "Strands"),
     # Git-distributed plugin bundle (Agent Plugins standard), not a registry

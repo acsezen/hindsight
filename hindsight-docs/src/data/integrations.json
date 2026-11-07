@@ -301,6 +301,16 @@
       "icon": "/img/icons/langgraph.svg"
     },
     {
+      "id": "librechat",
+      "name": "LibreChat",
+      "description": "Native memory lifecycle adapter for self-hosted LibreChat: automatic recall/reflect injection per turn, durable capture of completed exchanges to one private bank, and owner-scoped read-only memory tools — independent of LibreChat's built-in memory settings.",
+      "type": "official",
+      "by": "hindsight",
+      "category": "framework",
+      "link": "/sdks/integrations/librechat",
+      "icon": "/img/icons/hindsight.png"
+    },
+    {
       "id": "llamaindex",
       "name": "LlamaIndex",
       "description": "Add persistent memory to LlamaIndex agents. Supports agent-driven tools (BaseToolSpec) and automatic memory (BaseMemory).",
