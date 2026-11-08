@@ -1,4 +1,14 @@
-import { link, lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { MemoryClient, MemoryError } from "./client.js";
@@ -32,7 +42,8 @@ function isReplace(job: CaptureJob): boolean {
 
 async function exists(path: string): Promise<boolean> {
   try {
-    await readFile(path);
+    // stat, not a read: a pending job can hold a whole conversation's transcript.
+    await stat(path);
     return true;
   } catch (error) {
     if (isMissing(error)) return false;
@@ -168,7 +179,11 @@ export class RetainOutbox {
     }
   }
 
-  /** Pending jobs oldest first; unreadable records are moved aside as before. */
+  /**
+   * Pending jobs oldest first; unreadable records are moved aside as before. This reads every
+   * pending record, which ordering needs (a job's document and sequence are inside it). The cost
+   * grows with the backlog; for one owner's chats that stays small even through an outage.
+   */
   private async pendingJobs(): Promise<Array<{ name: string; path: string; job: CaptureJob }>> {
     const names = (await readdir(this.pendingDir)).filter((name) => name.endsWith(".json")).sort();
     const entries: Array<{ name: string; path: string; job: CaptureJob }> = [];
@@ -193,16 +208,17 @@ export class RetainOutbox {
 
   /** Where each operation stands locally: still queued, done, or moved aside as blocked. */
   async states(operationIds: string[]): Promise<Map<string, OperationState>> {
-    const states = new Map<string, OperationState>();
-    for (const operationId of operationIds) {
+    const state = async (operationId: string): Promise<OperationState> => {
       const name = `${operationId}.json`;
-      let state: OperationState = "missing";
-      if (await exists(join(this.completedDir, name))) state = "completed";
-      else if (await exists(join(this.blockedDir, name))) state = "blocked";
-      else if (await exists(join(this.pendingDir, name))) state = "pending";
-      states.set(operationId, state);
-    }
-    return states;
+      if (await exists(join(this.completedDir, name))) return "completed";
+      if (await exists(join(this.blockedDir, name))) return "blocked";
+      if (await exists(join(this.pendingDir, name))) return "pending";
+      return "missing";
+    };
+    const entries = await Promise.all(
+      operationIds.map(async (operationId) => [operationId, await state(operationId)] as const)
+    );
+    return new Map(entries);
   }
 
   drain(): Promise<void> {

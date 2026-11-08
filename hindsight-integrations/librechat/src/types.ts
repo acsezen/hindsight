@@ -28,6 +28,8 @@ export interface MemoryContext {
   text: string;
   status: "available" | "empty" | "unavailable" | "skipped";
   source?: "recall" | "reflect" | "pages";
+  /** The knowledge-page tool guide, for agents that have the read tools attached. */
+  guide?: string;
 }
 
 export interface MemoryEvent {

@@ -143,6 +143,9 @@ export function transcriptJobs(config: MemoryConfig, write: TranscriptWrite): Ca
       const request = {
         items: [{ ...item, content: jsonl([exchange]), update_mode: "append" as const }],
       };
-      return job(request, JSON.stringify({ bankId: config.bankId, request }));
+      // The exchange's ids are part of the identity (not the content): two exchanges with the
+      // same text are distinct appends, while a re-planned one keeps its id.
+      const exchangeId = { user: exchange.user, response: exchange.response };
+      return job(request, JSON.stringify({ bankId: config.bankId, request, exchange: exchangeId }));
     });
 }

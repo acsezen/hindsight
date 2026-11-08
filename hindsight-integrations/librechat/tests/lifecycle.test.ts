@@ -75,6 +75,8 @@ let conversations: Map<string, HostConversation>;
 let jobs: Map<string, HostGenerationJob>;
 let blockingJobs: string[];
 let existingDocuments: Set<string>;
+let knowledgeTree: { roots: unknown[] };
+let documentProbeStatus: number;
 let generation = 1762500000000;
 
 /** Host services as LibreChat supplies them: owner-scoped conversation reads and job state. */
@@ -246,6 +248,8 @@ beforeEach(async () => {
   jobs = new Map();
   blockingJobs = [];
   existingDocuments = new Set();
+  knowledgeTree = { roots: [{ id: "page-one", kind: "page", name: "Decisions" }] };
+  documentProbeStatus = 200;
   directory = await mkdtemp(join(tmpdir(), "hindsight-librechat-"));
   requests = [];
   operations = new Map();
@@ -356,15 +360,16 @@ beforeEach(async () => {
         })
       );
     } else if (path.endsWith("/knowledge-base/tree")) {
-      response.end(
-        JSON.stringify({ roots: [{ id: "page-one", kind: "page", name: "Decisions" }] })
-      );
+      response.end(JSON.stringify(knowledgeTree));
     } else if (
       path.includes("/documents/conversation%3A") ||
       path.includes("/documents/conversation:")
     ) {
       const documentId = decodeURIComponent(path.split("/documents/")[1] ?? "");
-      if (existingDocuments.has(documentId)) {
+      if (documentProbeStatus !== 200) {
+        response.writeHead(documentProbeStatus);
+        response.end(JSON.stringify({ detail: "unavailable" }));
+      } else if (existingDocuments.has(documentId)) {
         response.end(JSON.stringify({ id: documentId, original_text: "Earlier transcript" }));
       } else {
         response.writeHead(404);
@@ -429,8 +434,9 @@ describe("automatic native lifecycle", () => {
     const context = await instance.retrieve(owner, "marker");
     expect(context.text).toContain("First judge relevance");
     expect(context.text).toContain("> 🧠 **From Hindsight memory**");
-    expect(context.text).toContain("1 knowledge page covers this user's memory");
-    expect(context.text).toContain("hindsight_search_knowledge_pages(query)");
+    expect(context.text).not.toContain("<hindsight-knowledge>");
+    expect(context.guide).toContain("1 knowledge page covers this user's memory");
+    expect(context.guide).toContain("hindsight_search_knowledge_pages(query)");
     // The page count is cached: a second turn does not re-read the tree.
     await instance.retrieve(owner, "marker again");
     expect(
@@ -440,15 +446,38 @@ describe("automatic native lifecycle", () => {
 
   it("keeps the tool guide out when native tools are off, and still offers it when recall fails", async () => {
     const withoutTools = await memory({ nativeTools: false });
-    expect((await withoutTools.retrieve(owner, "marker")).text).not.toContain(
-      "hindsight-knowledge"
-    );
+    expect((await withoutTools.retrieve(owner, "marker")).guide).toBeUndefined();
     recallStatus = 503;
     const failing = await memory();
     const context = await failing.retrieve(owner, "marker");
     expect(context.status).toBe("unavailable");
-    expect(context.text).toContain("<hindsight-knowledge>");
-    expect(context.text).not.toContain("<hindsight-memory>");
+    expect(context.text).toBe("");
+    expect(context.guide).toContain("<hindsight-knowledge>");
+  });
+
+  it("counts knowledge pages inside folders", async () => {
+    knowledgeTree = {
+      roots: [
+        {
+          id: "folder-one",
+          kind: "folder",
+          name: "People",
+          children: [
+            { id: "page-a", kind: "page", name: "User Profile" },
+            {
+              id: "folder-two",
+              kind: "folder",
+              name: "Work",
+              children: [{ id: "page-b", kind: "page", name: "Current Projects" }],
+            },
+          ],
+        },
+      ],
+    };
+    const instance = await memory();
+    expect((await instance.retrieve(owner, "marker")).guide).toContain(
+      "2 knowledge pages cover this user's memory"
+    );
   });
 
   it("reserves time for recall after a reflection deadline", async () => {
@@ -1444,18 +1473,23 @@ describe("per-conversation consent", () => {
     const factory = (tool: MemoryTool) => new DynamicStructuredTool(tool);
     instance.attachTools(request, [primary, marked, plain], factory, () => {}, true);
     expect([primary, marked, plain].map((agent) => agent.tools.length)).toEqual([8, 8, 0]);
-    const injected = [primary, marked, plain].map((agent) => {
-      const parts: string[] = [];
-      instance.appendAgentContext(request, agent, context, parts, new Set(), []);
-      return parts.length;
-    });
-    expect(injected).toEqual([1, 1, 0]);
+    const injected = () =>
+      [primary, marked, plain].map((agent) => {
+        const parts: string[] = [];
+        instance.appendAgentContext(request, agent, context, parts, new Set(), []);
+        return parts;
+      });
+    // Memory plus the knowledge-page tool guide for each capable agent with the tools attached.
+    expect(injected().map((parts) => parts.length)).toEqual([2, 2, 0]);
+    expect(injected()[0][1]).toContain("<hindsight-knowledge>");
     expect(await turnRecords()).toEqual([
       expect.objectContaining({ enabled: true, capableAgentIds: ["primary", "marked"] }),
     ]);
 
     instance.attachTools(request, [primary, marked, plain], factory, () => {}, false);
     expect([primary, marked, plain].map((agent) => agent.tools.length)).toEqual([0, 0, 0]);
+    // With the host's tools gate off the guide would name tools the agent does not have.
+    expect(injected().map((parts) => parts.length)).toEqual([1, 1, 0]);
     expect((await instance.prepare(input(request, config)))?.status).toBe("available");
   });
 
@@ -2053,6 +2087,37 @@ describe("conversation documents", () => {
     expect(await database.collection("hindsighttranscripts").findOne({})).toMatchObject({
       partial: true,
     });
+  });
+
+  it("still queues the first exchange when Hindsight cannot be asked whether the document exists", async () => {
+    bankProtected = false;
+    documentProbeStatus = 503;
+    const instance = newBridge();
+    await enableConsent(instance);
+    await turn(instance, u1(), r1());
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "append", answers: ["r1"] },
+    ]);
+    expect(await database.collection("hindsighttranscripts").findOne({})).toMatchObject({
+      partial: true,
+    });
+    expect(events.map((event) => event.code)).toContain("transcript_probe_unavailable");
+  });
+
+  it("replaces the document when a reply is continued under the same message id", async () => {
+    bankProtected = false;
+    const instance = newBridge();
+    await enableConsent(instance);
+    const question = u1();
+    const cut = r1();
+    await turn(instance, question, cut);
+    await database
+      .collection("messages")
+      .updateOne({ messageId: "r1" }, { $set: { text: "answer r1 continued" } });
+    await turn(instance, question, { ...cut, text: "answer r1 continued" });
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "replace", answers: ["r1 continued"] },
+    ]);
   });
 
   it("never puts a turn taken while consent was Off into the document", async () => {

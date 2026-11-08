@@ -1,23 +1,38 @@
 import { describe, expect, it } from "vitest";
-import { branchExchanges, planTranscript } from "../src/transcript.js";
+import { branchExchanges, exchangeTurns, planTranscript, written } from "../src/transcript.js";
 import type { BranchExchange, TranscriptMessage, TranscriptRecord } from "../src/transcript.js";
 
 const ROOT = "00000000-0000-0000-0000-000000000000";
+const byId = new Map<string, TranscriptMessage>();
 
 /** A linear history u1 → r1 → u2 → r2 …, with optional siblings added by each test. */
 function message(
   messageId: string,
   parentMessageId: string,
   isCreatedByUser: boolean,
-  minute: number
+  minute: number,
+  text = `${isCreatedByUser ? "ask" : "answer"} ${messageId}`
 ): TranscriptMessage {
-  return {
+  const created = {
     messageId,
     parentMessageId,
     isCreatedByUser,
-    text: `${isCreatedByUser ? "ask" : "answer"} ${messageId}`,
+    text,
     createdAt: new Date(Date.UTC(2026, 10, 8, 9, minute)),
   };
+  byId.set(messageId, created);
+  return created;
+}
+
+/** The document's entry for the exchange that `response` answers, as it was written. */
+function entry(response: string) {
+  const reply = byId.get(response)!;
+  const user = byId.get(reply.parentMessageId!)!;
+  return written({
+    user: user.messageId!,
+    response,
+    turns: exchangeTurns(user, reply),
+  });
 }
 
 const u1 = message("u1", ROOT, true, 0);
@@ -30,12 +45,12 @@ const linear = [u1, r1, u2, r2, u3, r3];
 
 const ids = (exchanges: BranchExchange[]) => exchanges.map((exchange) => exchange.response);
 
-function record(written: string[], overrides: Partial<TranscriptRecord> = {}): TranscriptRecord {
-  const pairs = written.map((response) => ({ user: `u${response.slice(1)}`, response }));
+function record(responses: string[], overrides: Partial<TranscriptRecord> = {}): TranscriptRecord {
+  const held = responses.map(entry);
   return {
     documentId: "conversation:c",
-    captured: pairs,
-    written: pairs,
+    captured: held.map(({ user, response }) => ({ user, response })),
+    written: held,
     partial: false,
     dirty: false,
     ops: [],
@@ -166,5 +181,20 @@ describe("planTranscript", () => {
 
   it("skips a retried completion of an exchange the document already holds", () => {
     expect(plan(linear, u3, r3, record(["r1", "r2", "r3"])).mode).toBe("skip");
+  });
+
+  it("replaces when a reply was continued or edited in place (same ids, new text)", () => {
+    const held = record(["r1", "r2", "r3"]);
+    const continued = { ...r3, text: "answer r3, continued with the rest of the reply" };
+    const result = plan(
+      linear.map((m) => (m.messageId === "r3" ? continued : m)),
+      u3,
+      continued,
+      held
+    );
+    expect(result.mode).toBe("replace");
+    expect(result.mode === "replace" && result.exchanges.at(-1)?.turns.at(-1)?.content).toBe(
+      continued.text
+    );
   });
 });

@@ -1,3 +1,4 @@
+import type { KnowledgeNode } from "@vectorize-io/hindsight-client";
 import { memoryConfigSchema } from "./config.js";
 import { MemoryClient, MemoryError } from "./client.js";
 import { knowledgeGuide, memoryBlock } from "./knowledge.js";
@@ -96,21 +97,23 @@ export class HindsightMemory {
         if (requestSignal.aborted) break;
       }
     }
-    const parts: string[] = [];
+    let text = "";
     if (found) {
       const bounded = found.text.slice(0, this.config.maxContextChars ?? 12000);
       // Escape the record delimiter so stored text cannot close its own data block.
       const escaped = bounded.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-      parts.push(memoryBlock(escaped));
+      text = memoryBlock(escaped);
     }
-    // The tool guide points at the read tools, so it only goes where they are attached.
+    // The tool guide is returned separately: the host adds it only for an agent the read tools
+    // were actually attached to (see LibreChatMemory.appendAgentContext).
+    let guide: string | undefined;
     if (this.config.nativeTools !== false && !requestSignal.aborted) {
       const pages = await this.knowledgePages(requestSignal);
-      if (pages !== undefined) parts.push(knowledgeGuide(pages));
+      if (pages !== undefined) guide = knowledgeGuide(pages);
     }
     // The status reports the memory lookup; the tool guide alone does not make memory available.
     const status = found ? "available" : unavailable ? "unavailable" : "empty";
-    return { status, source: found?.source, text: parts.join("\n\n") };
+    return { status, source: found?.source, text, ...(guide ? { guide } : {}) };
   }
 
   /**
@@ -124,7 +127,10 @@ export class HindsightMemory {
     }
     try {
       const tree = await this.client.knowledgeTree(signal);
-      const value = tree.roots.filter((node) => node.kind === "page").length;
+      // Pages may sit in folders at any depth.
+      const count = (nodes: KnowledgeNode[] = []): number =>
+        nodes.reduce((sum, node) => sum + (node.kind === "page" ? 1 : 0) + count(node.children), 0);
+      const value = count(tree.roots);
       this.pageCount = { value, at: Date.now() };
       return value;
     } catch {

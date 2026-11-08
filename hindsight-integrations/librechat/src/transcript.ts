@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { MemoryError } from "./client.js";
 import type { ConsentCollection, ConsentDatabase, ConsentKey } from "./consent.js";
@@ -38,8 +39,32 @@ export interface TranscriptMessage {
   createdAt?: string | Date;
 }
 
+/** What the document holds for one exchange: its ids and a digest of the text it was written with. */
+export interface WrittenExchange extends ExchangeId {
+  digest: string;
+}
+
 export const exchangeKey = (exchange: ExchangeId): string =>
   `${exchange.user}\n${exchange.response}`;
+
+/**
+ * The visible text an exchange was written with (timestamps excluded). LibreChat's Continue and
+ * in-place edits keep the reply's message id and change its text, so ids alone would call the
+ * document current while it holds the old text.
+ */
+export function exchangeDigest(exchange: BranchExchange): string {
+  return createHash("sha256")
+    .update(JSON.stringify(exchange.turns.map((turn) => [turn.role, turn.content])))
+    .digest("hex")
+    .slice(0, 32);
+}
+
+export function written(exchange: BranchExchange): WrittenExchange {
+  return { user: exchange.user, response: exchange.response, digest: exchangeDigest(exchange) };
+}
+
+const holds = (entry: WrittenExchange, exchange: BranchExchange): boolean =>
+  exchangeKey(entry) === exchangeKey(exchange) && entry.digest === exchangeDigest(exchange);
 
 /** Visible text only; never tool results, reasoning, media or skill primes. */
 export function visibleText(message: TranscriptMessage): string {
@@ -131,8 +156,8 @@ export interface TranscriptRecord {
   documentId: string;
   /** Every exchange ever captured here (ids only): a branch the user returns to keeps them. */
   captured: ExchangeId[];
-  /** What the document holds, in order (ids only — no conversation text is kept locally). */
-  written: ExchangeId[];
+  /** What the document holds, in order (ids and a text digest — no conversation text is kept). */
+  written: WrittenExchange[];
   /**
    * The document holds content this record cannot account for (it existed before the record
    * did, e.g. after a rollback and roll-forward). Such a document is only ever appended to:
@@ -167,10 +192,10 @@ export function planTranscript(input: {
   blocked: boolean;
 }): TranscriptPlan {
   const { record, branch, current } = input;
-  const written = record?.written ?? [];
-  if (written.some((exchange) => exchangeKey(exchange) === exchangeKey(current))) {
-    // A retried completion of an exchange the document already holds.
-    if (!record?.dirty && !input.blocked) return { mode: "skip" };
+  const held = record?.written ?? [];
+  // A retried completion of an exchange the document already holds, with the same text.
+  if (held.some((entry) => holds(entry, current)) && !record?.dirty && !input.blocked) {
+    return { mode: "skip" };
   }
   if (!record) {
     if (input.documentExists) return { mode: "append", exchanges: [current] };
@@ -180,19 +205,20 @@ export function planTranscript(input: {
   const captured = new Set([...record.captured, current].map(exchangeKey));
   const desired = branch.filter((exchange) => captured.has(exchangeKey(exchange)));
   if (record.dirty || input.blocked) return { mode: "replace", exchanges: desired };
+  // A continued or edited reply keeps its ids but not its text: that breaks the prefix too.
   const prefix =
-    written.length <= desired.length &&
-    written.every((exchange, index) => exchangeKey(exchange) === exchangeKey(desired[index]));
+    held.length <= desired.length && held.every((entry, index) => holds(entry, desired[index]));
   if (!prefix) return { mode: "replace", exchanges: desired };
-  const fresh = desired.slice(written.length);
+  const fresh = desired.slice(held.length);
   return fresh.length ? { mode: "append", exchanges: fresh } : { mode: "skip" };
 }
 
 const exchangeRow = z.object({ user: z.string(), response: z.string() }).strict();
+const writtenRow = exchangeRow.extend({ digest: z.string() }).strict();
 const recordRow = z.object({
   documentId: z.string().min(1),
   captured: z.array(exchangeRow),
-  written: z.array(exchangeRow),
+  written: z.array(writtenRow),
   partial: z.boolean(),
   dirty: z.boolean(),
   ops: z.array(z.string()),
