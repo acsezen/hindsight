@@ -420,7 +420,35 @@ describe("automatic native lifecycle", () => {
     expect(requests.map((request) => request.path)).toEqual([
       "/v1/default/banks/librechat-private/reflect",
       "/v1/default/banks/librechat-private/memories/recall",
+      "/v1/default/banks/librechat-private/knowledge-base/tree",
     ]);
+  });
+
+  it("frames retrieved memory the extension's way and adds the knowledge-page tool guide", async () => {
+    const instance = await memory();
+    const context = await instance.retrieve(owner, "marker");
+    expect(context.text).toContain("First judge relevance");
+    expect(context.text).toContain("> 🧠 **From Hindsight memory**");
+    expect(context.text).toContain("1 knowledge page covers this user's memory");
+    expect(context.text).toContain("hindsight_search_knowledge_pages(query)");
+    // The page count is cached: a second turn does not re-read the tree.
+    await instance.retrieve(owner, "marker again");
+    expect(
+      requests.filter((request) => request.path.endsWith("/knowledge-base/tree"))
+    ).toHaveLength(1);
+  });
+
+  it("keeps the tool guide out when native tools are off, and still offers it when recall fails", async () => {
+    const withoutTools = await memory({ nativeTools: false });
+    expect((await withoutTools.retrieve(owner, "marker")).text).not.toContain(
+      "hindsight-knowledge"
+    );
+    recallStatus = 503;
+    const failing = await memory();
+    const context = await failing.retrieve(owner, "marker");
+    expect(context.status).toBe("unavailable");
+    expect(context.text).toContain("<hindsight-knowledge>");
+    expect(context.text).not.toContain("<hindsight-memory>");
   });
 
   it("reserves time for recall after a reflection deadline", async () => {
@@ -828,7 +856,8 @@ describe("LibreChat native request bridge", () => {
     expect(payload).not.toContain("hidden reasoning");
     expect(payload).not.toContain("tool-result-not-captured");
     expect(payload).not.toContain("data:image");
-    expect(payload).not.toContain("Recalled Hindsight records");
+    expect(payload).not.toContain("hindsight-memory");
+    expect(payload).not.toContain("hindsight-knowledge");
     expect(user.text).toBe("raw user text");
   });
 
