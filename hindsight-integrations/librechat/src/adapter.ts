@@ -1,12 +1,13 @@
 import { memoryConfigSchema } from "./config.js";
 import { MemoryClient, MemoryError } from "./client.js";
 import { RetainOutbox } from "./outbox.js";
-import { captureJob } from "./records.js";
+import type { OperationState } from "./outbox.js";
+import { transcriptJobs } from "./records.js";
+import type { TranscriptWrite } from "./records.js";
 import { readTools } from "./tools.js";
 import type { MemoryInspector, MemoryTool } from "./tools.js";
 import type {
   CaptureResult,
-  CompletedExchange,
   MemoryActor,
   MemoryConfig,
   MemoryContext,
@@ -99,16 +100,37 @@ export class HindsightMemory {
     return { text: "", status: unavailable ? "unavailable" : "empty" };
   }
 
-  async capture(exchange: CompletedExchange): Promise<CaptureResult> {
-    if (!this.allows(exchange) || !exchange.completed) return { status: "skipped" };
-    if (!exchange.userText.trim() && !exchange.assistantText.trim()) return { status: "skipped" };
-    if (!exchange.conversationId || !exchange.userMessageId || !exchange.responseMessageId) {
+  /** Queue one planned write to a conversation's document (see `planTranscript`). */
+  async capture(write: TranscriptWrite): Promise<CaptureResult> {
+    if (!this.allows(write)) return { status: "skipped", operationIds: [] };
+    if (
+      !write.conversationId ||
+      write.exchanges.some((exchange) => !exchange.user || !exchange.response)
+    ) {
       throw new MemoryError("invalid_completed_exchange");
     }
-    const job = captureJob(this.config, exchange);
-    const status = await this.outbox.enqueue(job);
+    const jobs = transcriptJobs(this.config, write);
+    if (jobs.length === 0) return { status: "skipped", operationIds: [] };
+    let status: CaptureResult["status"] = "completed";
+    for (const job of jobs) {
+      if ((await this.outbox.enqueue(job)) === "queued") status = "queued";
+    }
     this.outbox.start();
-    return { status, operationId: job.operationId };
+    return { status, operationIds: jobs.map((job) => job.operationId) };
+  }
+
+  /** Whether the bank already holds this document (no record must never shrink it). */
+  async documentExists(documentId: string, signal?: AbortSignal): Promise<boolean> {
+    const requestSignal = AbortSignal.any([
+      this.lifetime.signal,
+      AbortSignal.timeout(this.config.requestTimeoutMs ?? 30000),
+      ...(signal ? [signal] : []),
+    ]);
+    return (await this.client.document(documentId, requestSignal)) !== null;
+  }
+
+  operationStates(operationIds: string[]): Promise<Map<string, OperationState>> {
+    return this.outbox.states(operationIds);
   }
 
   tools(actor: MemoryActor, inspect: MemoryInspector, signal?: AbortSignal): MemoryTool[] {

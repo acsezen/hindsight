@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
-import type { CompletedExchange, MemoryConfig } from "./types.js";
+import type { BranchExchange, ExchangeId } from "./transcript.js";
+import type { MemoryActor, MemoryConfig } from "./types.js";
 
 const itemSchema = z
   .object({
@@ -11,6 +12,9 @@ const itemSchema = z
     tags: z.array(z.string()),
     observation_scopes: z.literal("shared"),
     timestamp: z.string().datetime().optional(),
+    // Absent on jobs queued before conversation documents (2026-11-08): those drain unchanged.
+    strategy: z.literal("conversation").optional(),
+    update_mode: z.literal("append").optional(),
   })
   .strict();
 
@@ -23,14 +27,40 @@ export const jobSchema = z
     submitted: z.boolean(),
     attempts: z.number().int().nonnegative(),
     nextAttemptAt: z.number().nonnegative(),
+    /** Submission order within one document; absent on older per-exchange jobs. */
+    sequence: z.number().int().nonnegative().optional(),
     request: z.object({ items: z.array(itemSchema).length(1) }).strict(),
   })
   .strict();
 
 export type CaptureJob = z.infer<typeof jobSchema>;
 
+/** One write to a conversation's document, as planned by `planTranscript`. */
+export interface TranscriptWrite extends MemoryActor {
+  conversationId: string;
+  mode: "append" | "replace";
+  exchanges: BranchExchange[];
+  /** The conversation's first turn: every write's item timestamp, as the extension does. */
+  startedAt: string;
+  /** What the document held before a replace; part of its operation identity (see below). */
+  previous: ExchangeId[];
+}
+
+/**
+ * The coding-agent extension's retain context, with "the coding agent" replaced by the LibreChat
+ * assistant: user turns are the user's words, assistant turns are claims, not established facts.
+ */
+export const RETAIN_CONTEXT =
+  "conversation between the user and an AI assistant in LibreChat: user turns are the user's words and " +
+  "decisions, assistant turns are the assistant's. When an assistant turn says something is fixed, true or " +
+  'done, record it as the assistant\'s claim ("the assistant said X"), not as an established fact.';
+
 export function fingerprint(text: string): string {
   return createHash("sha256").update(text).digest("hex");
+}
+
+export function conversationDocumentId(conversationId: string): string {
+  return `conversation:${conversationId}`;
 }
 
 function operationUuid(value: string): string {
@@ -45,53 +75,74 @@ function operationUuid(value: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export function captureJob(config: MemoryConfig, exchange: CompletedExchange): CaptureJob {
-  const identity = [
-    exchange.userId,
-    exchange.conversationId,
-    exchange.userMessageId,
-    exchange.responseMessageId,
-    exchange.userText,
-    exchange.assistantText,
-  ];
-  // Each committed reply/version has its own source document. A conversation-wide
-  // replacement would erase other branches; append would duplicate transport retries.
-  const documentId = `librechat:${fingerprint(JSON.stringify(identity))}`;
-  const request: CaptureJob["request"] = {
-    items: [
-      {
-        content: [
-          exchange.userText.trim() ? `User:\n${exchange.userText}` : "",
-          exchange.assistantText.trim() ? `Assistant:\n${exchange.assistantText}` : "",
-        ]
-          .filter(Boolean)
-          .join("\n\n"),
-        document_id: documentId,
-        context:
-          "LibreChat conversation exchange. Assistant statements are responses, not independently verified user facts.",
-        metadata: {
-          source: "librechat",
-          harness: "librechat",
-          user_id: exchange.userId,
-          conversation_id: exchange.conversationId,
-          user_message_id: exchange.userMessageId,
-          response_message_id: exchange.responseMessageId,
-          ...(exchange.model ? { model: exchange.model } : {}),
-        },
-        tags: ["source:librechat", `conversation:${fingerprint(exchange.conversationId)}`],
-        observation_scopes: "shared",
-        ...(exchange.timestamp ? { timestamp: exchange.timestamp } : {}),
-      },
-    ],
+/** JSONL, one turn per line: the server's structured chunker never splits a turn. */
+function jsonl(exchanges: BranchExchange[]): string {
+  return exchanges
+    .flatMap((exchange) => exchange.turns)
+    .map((turn) => JSON.stringify(turn))
+    .join("\n");
+}
+
+let lastSequence = 0;
+
+/** Monotonic across calls in this process, so FIFO holds even within one millisecond. */
+function nextSequence(): number {
+  lastSequence = Math.max(Date.now() * 1000, lastSequence + 1);
+  return lastSequence;
+}
+
+/**
+ * The jobs for one write. A replace is one job holding the whole branch. An append is one job
+ * per new exchange, so its content and operation id depend on that exchange alone: a write that
+ * is planned again after a lost acknowledgement re-creates the same job, which the outbox and the
+ * server both collapse into the original instead of appending the exchange twice.
+ */
+export function transcriptJobs(config: MemoryConfig, write: TranscriptWrite): CaptureJob[] {
+  const documentId = conversationDocumentId(write.conversationId);
+  const item = {
+    document_id: documentId,
+    context: RETAIN_CONTEXT,
+    metadata: {
+      source: "librechat",
+      harness: "librechat",
+      user_id: write.userId,
+      conversation_id: write.conversationId,
+    },
+    // `source:chat` + `harness:<id>`, as every conversation the extension retains carries.
+    tags: ["source:chat", "harness:librechat"],
+    observation_scopes: "shared" as const,
+    strategy: "conversation" as const,
+    timestamp: write.startedAt,
   };
-  return jobSchema.parse({
-    version: 1,
-    operationId: operationUuid(JSON.stringify({ bankId: config.bankId, request })),
-    bankId: config.bankId,
-    ownerUserId: config.ownerUserId,
-    submitted: false,
-    attempts: 0,
-    nextAttemptAt: 0,
-    request,
-  });
+  const job = (request: CaptureJob["request"], identity: string): CaptureJob =>
+    jobSchema.parse({
+      version: 1,
+      operationId: operationUuid(identity),
+      bankId: config.bankId,
+      ownerUserId: config.ownerUserId,
+      submitted: false,
+      attempts: 0,
+      nextAttemptAt: 0,
+      sequence: nextSequence(),
+      request,
+    });
+  if (write.mode === "replace") {
+    const content = jsonl(write.exchanges);
+    if (!content) return [];
+    const request = { items: [{ ...item, content }] };
+    // Content alone repeats when a user returns to an earlier branch (A → B → A), and the
+    // server acknowledges an already-completed id without applying it, which would leave B
+    // stored. Naming what the document held before keeps each replace distinct (extension #5845).
+    return [
+      job(request, JSON.stringify({ bankId: config.bankId, request, previous: write.previous })),
+    ];
+  }
+  return write.exchanges
+    .filter((exchange) => exchange.turns.length > 0)
+    .map((exchange) => {
+      const request = {
+        items: [{ ...item, content: jsonl([exchange]), update_mode: "append" as const }],
+      };
+      return job(request, JSON.stringify({ bankId: config.bankId, request }));
+    });
 }
