@@ -3,7 +3,56 @@ import { MemoryError } from "./client.js";
 import { ConsentStore, turnGeneration } from "./consent.js";
 import type { ConsentDatabase, ConsentKey, TurnKey, TurnRecord } from "./consent.js";
 import type { MemoryInspector, MemoryTool, MemoryToolDefinition } from "./tools.js";
+import { conversationDocumentId } from "./records.js";
+import {
+  TranscriptStore,
+  branchExchanges,
+  exchangeKey,
+  exchangeTurns,
+  planTranscript,
+  visibleText,
+  written,
+} from "./transcript.js";
+import type {
+  BranchExchange,
+  ExchangeId,
+  TranscriptMessage,
+  TranscriptRecord,
+} from "./transcript.js";
 import type { MemoryConfig, MemoryContext, MemoryReporter } from "./types.js";
+
+/** Outstanding appends a record remembers; older ones have long completed or been replaced. */
+const MAX_TRACKED_OPS = 32;
+
+/** Plans of one write, before falling back to an append (see `writeTranscript`). */
+const MAX_TRANSCRIPT_ATTEMPTS = 3;
+
+/**
+ * The message fields the branch walk needs (LibreChat v0.8.8 `messages` schema). Only each content
+ * part's type and text: tool results, reasoning and attachments stay in the database.
+ */
+const messageProjection = {
+  _id: 0,
+  messageId: 1,
+  parentMessageId: 1,
+  isCreatedByUser: 1,
+  text: 1,
+  "content.type": 1,
+  "content.text": 1,
+  createdAt: 1,
+} as const;
+
+function recordFields(record: TranscriptRecord): Omit<TranscriptRecord, "version"> {
+  const { version: _version, ...fields } = record;
+  return fields;
+}
+
+/** `captured` with this exchange in it; the same array when it already was. */
+function withCaptured(captured: ExchangeId[], current: ExchangeId): ExchangeId[] {
+  return captured.some((exchange) => exchangeKey(exchange) === exchangeKey(current))
+    ? captured
+    : [...captured, { user: current.user, response: current.response }];
+}
 
 /** The `agent.tools` entry that makes a saved agent Hindsight-capable. Never a model tool. */
 export const HINDSIGHT_TOOL = "hindsight";
@@ -18,18 +67,10 @@ export interface LibreChatUser {
   personalization?: { memories?: boolean };
 }
 
-export interface LibreChatMessage {
-  messageId?: string;
+export interface LibreChatMessage extends TranscriptMessage {
   conversationId?: string;
-  parentMessageId?: string;
-  isCreatedByUser?: boolean;
   unfinished?: boolean;
-  text?: string;
   model?: string;
-  content?: Array<{
-    type?: string;
-    text?: string | { value?: string };
-  }>;
 }
 
 export interface LibreChatMemoryContext extends MemoryContext {
@@ -174,15 +215,6 @@ export interface NativeMemoryAgent<T extends { name: string }> {
   };
 }
 
-/** Select only visible message text; never tool results, reasoning, media or skill primes. */
-export function visibleText(message: LibreChatMessage): string {
-  if (message.text?.trim()) return message.text;
-  return (message.content ?? [])
-    .filter((part) => part.type === "text")
-    .map((part) => (typeof part.text === "string" ? part.text : (part.text?.value ?? "")))
-    .join("\n");
-}
-
 /** The primary and its reachable (post-pruning) connected agents, without subagents. */
 function runtimeAgents(client: AdmissionClient): RuntimeAgent[] {
   return [client.options.agent, ...(client.agentConfigs?.values() ?? [])].filter(
@@ -223,6 +255,9 @@ export class LibreChatMemory {
   /** The single consent input for prepare, tools, context and capture. Absent is Off. */
   private readonly admissions = new WeakMap<object, Admission>();
   private store?: Promise<ConsentStore>;
+  private transcripts?: Promise<TranscriptStore>;
+  /** The write in progress per conversation (see `serialize`). */
+  private readonly writing = new Map<string, Promise<void>>();
 
   constructor(
     private readonly getSecret: (name: string) => string | undefined,
@@ -246,6 +281,18 @@ export class LibreChatMemory {
     // A failed open (for example index creation) is retried by a later turn; meanwhile all turns are Off.
     opening.catch(() => {
       if (this.store === opening) this.store = undefined;
+    });
+    return opening;
+  }
+
+  private transcriptStore(): Promise<TranscriptStore> {
+    if (this.transcripts) return this.transcripts;
+    const database = this.consent?.database();
+    if (!database) return Promise.reject(new MemoryError("consent_store_unavailable"));
+    const opening = TranscriptStore.open(database);
+    this.transcripts = opening;
+    opening.catch(() => {
+      if (this.transcripts === opening) this.transcripts = undefined;
     });
     return opening;
   }
@@ -632,18 +679,188 @@ export class LibreChatMemory {
       this.report({ code: "capture_skipped_consent_changed" });
       return;
     }
+    if (response.unfinished === true) return;
+    const key = admission.key;
+    await this.serialize(`${key.user}\n${key.conversationId}`, () =>
+      this.writeTranscript(session, key, userMessage, response)
+    );
+  }
+
+  /** One write at a time per conversation, so each plans from the state the previous one left. */
+  private async serialize(key: string, task: () => Promise<void>): Promise<void> {
+    const run = (this.writing.get(key) ?? Promise.resolve()).catch(() => {}).then(task);
+    this.writing.set(key, run);
+    try {
+      await run;
+    } finally {
+      if (this.writing.get(key) === run) this.writing.delete(key);
+    }
+  }
+
+  /**
+   * Plan and queue this exchange's write to the conversation document (see `planTranscript`).
+   * The branch comes from LibreChat's own message tree, read here rather than taken from the
+   * request, so a resumed completion (which has no request history) plans the same way. A
+   * compare-and-set lost to another writer re-plans from the newer record; an exchange is never
+   * dropped: if every attempt loses, it is appended (which cannot shrink the document) and the
+   * record is marked so the next write replaces.
+   */
+  private async writeTranscript(
+    session: MemorySession,
+    key: ConsentKey,
+    userMessage: LibreChatMessage,
+    response: LibreChatMessage
+  ): Promise<void> {
+    const database = this.consent?.database();
+    if (!database) throw new MemoryError("consent_store_unavailable");
+    const store = await this.transcriptStore();
+    let history: TranscriptMessage[] | undefined;
+    const readHistory = async (): Promise<TranscriptMessage[]> =>
+      (history ??= (await database
+        .collection("messages")
+        .find(
+          { user: key.user, conversationId: key.conversationId },
+          { projection: messageProjection }
+        )
+        .toArray()) as TranscriptMessage[]);
+    const documentId = conversationDocumentId(key.conversationId);
+    let current: BranchExchange | undefined;
+    for (let attempt = 0; attempt < MAX_TRANSCRIPT_ATTEMPTS; attempt++) {
+      const record = await store.read(key);
+      let ops = record?.ops ?? [];
+      let blocked = false;
+      if (ops.length) {
+        const states = await session.memory.operationStates(ops);
+        blocked = ops.some((id) => states.get(id) === "blocked");
+        ops = ops.filter((id) => states.get(id) === "pending");
+      }
+      // Fast path: the exchange directly continues what the document holds, so walking the
+      // branch (a read of every message in the conversation) cannot change the plan.
+      const continues =
+        record !== null &&
+        !record.dirty &&
+        !record.partial &&
+        !blocked &&
+        record.written.at(-1)?.response === userMessage.parentMessageId &&
+        userMessage.createdAt !== undefined &&
+        response.createdAt !== undefined;
+      const stored = continues ? [] : await readHistory();
+      // Each turn carries its stored time, so two identical exchanges never share an append
+      // identity. Never the wall clock: a re-planned write must produce the same bytes.
+      const stamped = (message: LibreChatMessage): LibreChatMessage => ({
+        ...message,
+        createdAt:
+          message.createdAt ?? stored.find((m) => m.messageId === message.messageId)?.createdAt,
+      });
+      const user = stamped(userMessage);
+      const reply = stamped(response);
+      current = {
+        user: user.messageId ?? "",
+        response: reply.messageId ?? "",
+        turns: exchangeTurns(user, reply),
+      };
+      if (current.turns.length === 0) return;
+      let documentExists = false;
+      if (!record) {
+        try {
+          documentExists = await session.memory.documentExists(documentId);
+        } catch (error) {
+          // Unknown is treated as existing: an append can never shrink a document, a replace
+          // could. The write is still queued durably instead of being lost to the outage.
+          this.report({
+            code: "transcript_probe_unavailable",
+            status: error instanceof MemoryError ? error.status : undefined,
+          });
+          documentExists = true;
+        }
+      }
+      const plan = planTranscript({
+        record,
+        branch: continues ? undefined : branchExchanges(stored, user, reply),
+        current,
+        documentExists,
+        blocked,
+      });
+      const captured = withCaptured(record?.captured ?? [], current);
+      if (plan.mode === "skip") {
+        if (record && captured !== record.captured) {
+          await store.write(key, { ...recordFields(record), captured, ops }, record);
+        }
+        return;
+      }
+      const base = {
+        documentId,
+        captured,
+        partial: record ? record.partial : documentExists,
+        startedAt:
+          record?.startedAt ?? plan.exchanges[0]?.turns[0]?.timestamp ?? new Date().toISOString(),
+      };
+      let expected = record;
+      if (plan.mode === "replace") {
+        // Claim before queueing, as the extension does: a replace whose outcome we never learn
+        // resolves to another replace rather than to an append onto an unknown state.
+        const claim = { ...base, written: record?.written ?? [], dirty: true, ops };
+        if (!(await store.write(key, claim, expected))) continue;
+        expected = await store.read(key);
+      }
+      const result = await session.memory.capture({
+        hindsightEnabled: true,
+        userId: session.user.id,
+        temporary: session.temporary,
+        conversationId: key.conversationId,
+        mode: plan.mode,
+        exchanges: plan.exchanges,
+        startedAt: base.startedAt,
+        previous: record?.written ?? [],
+      });
+      const fresh = plan.exchanges.map(written);
+      const next = {
+        ...base,
+        written: plan.mode === "replace" ? fresh : [...(record?.written ?? []), ...fresh],
+        dirty: false,
+        ops:
+          plan.mode === "replace"
+            ? result.operationIds
+            : [...ops, ...result.operationIds].slice(-MAX_TRACKED_OPS),
+      };
+      if (!(await store.write(key, next, expected))) await this.keepCaptured(store, key, current);
+      return;
+    }
+    // Every attempt lost its claim to another writer. Queue the exchange anyway as an append.
+    if (!current) return;
     await session.memory.capture({
       hindsightEnabled: true,
       userId: session.user.id,
       temporary: session.temporary,
-      conversationId: response.conversationId,
-      userMessageId: userMessage.messageId,
-      responseMessageId: response.messageId,
-      userText: visibleText(userMessage),
-      assistantText: visibleText(response),
-      model: response.model,
-      completed: response.unfinished !== true,
+      conversationId: key.conversationId,
+      mode: "append",
+      exchanges: [current],
+      startedAt: current.turns[0]?.timestamp ?? new Date().toISOString(),
+      previous: [],
     });
+    await this.keepCaptured(store, key, current);
+  }
+
+  /**
+   * After a lost compare-and-set: keep the exchange in `captured` (later plans filter on it) and
+   * mark the record dirty, so the next write rebuilds the document with it.
+   */
+  private async keepCaptured(
+    store: TranscriptStore,
+    key: ConsentKey,
+    current: ExchangeId
+  ): Promise<void> {
+    for (let attempt = 0; attempt < MAX_TRANSCRIPT_ATTEMPTS; attempt++) {
+      const latest = await store.read(key);
+      if (!latest) break;
+      const next = {
+        ...recordFields(latest),
+        captured: withCaptured(latest.captured, current),
+        dirty: true,
+      };
+      if (await store.write(key, next, latest)) return;
+    }
+    this.report({ code: "transcript_conflict" });
   }
 
   query(
@@ -816,10 +1033,22 @@ export class LibreChatMemory {
     inspection: { add(value: string): unknown },
     agentInspection: string[]
   ): void {
-    if (!context?.text || !this.agentAllowed(request, agent)) return;
-    parts.push(context.text);
-    inspection.add(context.text);
-    agentInspection.push(context.text);
+    if (!context || !this.agentAllowed(request, agent)) return;
+    const blocks = [context.text];
+    // The tool guide names the read tools: only an agent this request attached them to gets it.
+    const binding = this.attachedAgents.get(agent);
+    if (
+      context.guide &&
+      binding?.request === request &&
+      binding.names.has("hindsight_search_knowledge_pages")
+    ) {
+      blocks.push(context.guide);
+    }
+    for (const block of blocks.filter(Boolean)) {
+      parts.push(block);
+      inspection.add(block);
+      agentInspection.push(block);
+    }
   }
 
   snapshots(

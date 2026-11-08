@@ -23,6 +23,10 @@ export interface ConsentCollection {
     options?: { upsert: boolean }
   ): Promise<{ matchedCount: number }>;
   insertOne(document: Record<string, unknown>): Promise<unknown>;
+  find(
+    filter: Record<string, unknown>,
+    options: { projection: Record<string, 0 | 1> }
+  ): { toArray(): Promise<unknown[]> };
 }
 
 export interface ConsentDatabase {

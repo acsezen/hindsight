@@ -1,4 +1,14 @@
-import { link, lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { MemoryClient, MemoryError } from "./client.js";
@@ -22,9 +32,18 @@ function isMissing(error: unknown): boolean {
   return errorCode(error) === "ENOENT";
 }
 
+export type OperationState = "pending" | "completed" | "blocked" | "missing";
+
+/** A conversation-document write without update_mode replaces the whole document. */
+function isReplace(job: CaptureJob): boolean {
+  const item = job.request.items[0];
+  return item.strategy === "conversation" && item.update_mode === undefined;
+}
+
 async function exists(path: string): Promise<boolean> {
   try {
-    await readFile(path);
+    // stat, not a read: a pending job can hold a whole conversation's transcript.
+    await stat(path);
     return true;
   } catch (error) {
     if (isMissing(error)) return false;
@@ -133,8 +152,73 @@ export class RetainOutbox {
     const path = join(this.pendingDir, name);
     // Duplicate writers carry the same immutable payload and operation UUID.
     // Resetting submission state is safe: the server deduplicates that UUID.
-    if (!(await exists(path))) await persist(path, this.pendingDir, job);
+    if (!(await exists(path))) {
+      if (isReplace(job)) await this.supersede(job);
+      await persist(path, this.pendingDir, job);
+    }
     return "queued";
+  }
+
+  /**
+   * A replace re-sends the whole branch, so earlier writes to the same document that were never
+   * submitted can only add what it already holds: drop them (the extension's replace drops its
+   * buffered appends the same way). Submitted ones stay; the server runs them before it.
+   */
+  private async supersede(replace: CaptureJob): Promise<void> {
+    const documentId = replace.request.items[0].document_id;
+    for (const { path, job } of await this.pendingJobs()) {
+      if (
+        job.request.items[0].document_id === documentId &&
+        !job.submitted &&
+        (job.sequence ?? 0) < (replace.sequence ?? 0)
+      ) {
+        await unlink(path).catch((error: unknown) => {
+          if (!isMissing(error)) throw error;
+        });
+      }
+    }
+  }
+
+  /**
+   * Pending jobs oldest first; unreadable records are moved aside as before. This reads every
+   * pending record, which ordering needs (a job's document and sequence are inside it). The cost
+   * grows with the backlog; for one owner's chats that stays small even through an outage.
+   */
+  private async pendingJobs(): Promise<Array<{ name: string; path: string; job: CaptureJob }>> {
+    const names = (await readdir(this.pendingDir)).filter((name) => name.endsWith(".json")).sort();
+    const entries: Array<{ name: string; path: string; job: CaptureJob }> = [];
+    for (const name of names) {
+      const path = join(this.pendingDir, name);
+      try {
+        const job = jobSchema.parse(JSON.parse(await readFile(path, "utf8")));
+        this.validateIdentity(job);
+        if (name !== `${job.operationId}.json`) throw new MemoryError("invalid_outbox_record");
+        entries.push({ name, path, job });
+      } catch (error) {
+        if (isMissing(error)) continue;
+        await rename(path, join(this.blockedDir, name));
+        this.report({ code: "invalid_outbox_record" });
+      }
+    }
+    // Per-exchange jobs queued before conversation documents carry no sequence and sort first.
+    return entries.sort(
+      (a, b) => (a.job.sequence ?? 0) - (b.job.sequence ?? 0) || a.name.localeCompare(b.name)
+    );
+  }
+
+  /** Where each operation stands locally: still queued, done, or moved aside as blocked. */
+  async states(operationIds: string[]): Promise<Map<string, OperationState>> {
+    const state = async (operationId: string): Promise<OperationState> => {
+      const name = `${operationId}.json`;
+      if (await exists(join(this.completedDir, name))) return "completed";
+      if (await exists(join(this.blockedDir, name))) return "blocked";
+      if (await exists(join(this.pendingDir, name))) return "pending";
+      return "missing";
+    };
+    const entries = await Promise.all(
+      operationIds.map(async (operationId) => [operationId, await state(operationId)] as const)
+    );
+    return new Map(entries);
   }
 
   drain(): Promise<void> {
@@ -152,34 +236,35 @@ export class RetainOutbox {
 
   private async drainPending(): Promise<void> {
     // One network request at a time; chat traffic cannot create an unbounded worker pool.
-    const names = (await readdir(this.pendingDir)).filter((name) => name.endsWith(".json")).sort();
-    if (names.length === 0) return;
-    const batch = Array.from(
-      { length: Math.min(32, names.length) },
-      (_, index) => names[(this.scanOffset + index) % names.length]
-    );
-    this.scanOffset = (this.scanOffset + batch.length) % names.length;
-    for (const name of batch) {
-      if (this.closed) return;
-      const path = join(this.pendingDir, name);
-      let job: CaptureJob;
-      try {
-        job = jobSchema.parse(JSON.parse(await readFile(path, "utf8")));
-        this.validateIdentity(job);
-        if (name !== `${job.operationId}.json`) throw new MemoryError("invalid_outbox_record");
-      } catch (error) {
-        if (isMissing(error)) continue;
-        await rename(path, join(this.blockedDir, name));
-        this.report({ code: "invalid_outbox_record" });
-        continue;
+    // A pass starts at a rotating offset so jobs still waiting on the server (each poll is a
+    // request) cannot starve the rest. Appends to one conversation document must still reach the
+    // server in the order they were written: the server runs one retain per document at a time, in
+    // submission order (async_operations.serialization_key). So only a document's oldest
+    // unsubmitted job may be submitted; the next one becomes eligible on a later pass.
+    const jobs = await this.pendingJobs();
+    const head = new Map<string, string>();
+    for (const { name, job } of jobs) {
+      const documentId = job.request.items[0].document_id;
+      if (job.sequence !== undefined && !job.submitted && !head.has(documentId)) {
+        head.set(documentId, name);
       }
+    }
+    const start = jobs.length ? this.scanOffset % jobs.length : 0;
+    let requests = 0;
+    for (let index = 0; index < jobs.length; index++) {
+      if (this.closed || requests >= 32) return;
+      const { name, path, job } = jobs[(start + index) % jobs.length];
+      this.scanOffset = start + index + 1;
+      const documentId = job.request.items[0].document_id;
       if (await exists(join(this.completedDir, name))) {
         await unlink(path).catch((error: unknown) => {
           if (!isMissing(error)) throw error;
         });
         continue;
       }
+      if (job.sequence !== undefined && !job.submitted && head.get(documentId) !== name) continue;
       if (job.nextAttemptAt > Date.now()) continue;
+      requests += 1;
       const signal = AbortSignal.any([
         this.abort.signal,
         AbortSignal.timeout(this.config.requestTimeoutMs ?? 30000),

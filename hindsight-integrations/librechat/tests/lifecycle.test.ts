@@ -17,7 +17,7 @@ import {
 import type { Db } from "mongodb";
 import type {
   AdmissionClient,
-  CompletedExchange,
+  BranchExchange,
   ConsentDependencies,
   HostConversation,
   HostGenerationJob,
@@ -27,6 +27,7 @@ import type {
   MemoryTool,
   MemoryToolDefinition,
   NativeMemoryAgent,
+  TranscriptWrite,
 } from "../src/index.js";
 
 interface RequestRecord {
@@ -38,7 +39,16 @@ interface RequestRecord {
 interface RetainBody {
   operation_id: string;
   async: boolean;
-  items: Array<{ content: string; document_id: string; metadata: Record<string, string> }>;
+  items: Array<{
+    content: string;
+    document_id: string;
+    metadata: Record<string, string>;
+    tags: string[];
+    context: string;
+    strategy?: string;
+    update_mode?: string;
+    timestamp?: string;
+  }>;
 }
 
 let directory: string;
@@ -64,6 +74,9 @@ let database: Db;
 let conversations: Map<string, HostConversation>;
 let jobs: Map<string, HostGenerationJob>;
 let blockingJobs: string[];
+let existingDocuments: Set<string>;
+let knowledgeTree: { roots: unknown[] };
+let documentProbeStatus: number;
 let generation = 1762500000000;
 
 /** Host services as LibreChat supplies them: owner-scoped conversation reads and job state. */
@@ -155,16 +168,51 @@ afterAll(async () => {
 /** Authorized adapter calls carry explicit consent; omission is Off. */
 const owner = { userId: "owner", hindsightEnabled: true };
 
-const exchange: CompletedExchange = {
+const firstExchange: BranchExchange = {
+  user: "user-message-one",
+  response: "reply-one",
+  turns: [
+    {
+      role: "user",
+      content: "Our recovery marker is MAPLE-73921. Preserve Turkish: dağıtım.",
+      timestamp: "2026-11-08T09:00:00.000Z",
+    },
+    {
+      role: "assistant",
+      content: "I recorded the recovery marker.",
+      timestamp: "2026-11-08T09:00:05.000Z",
+    },
+  ],
+};
+
+/** One planned append of the first exchange to conversation-one's document. */
+const write: TranscriptWrite = {
   ...owner,
   conversationId: "conversation-one",
-  userMessageId: "user-message-one",
-  responseMessageId: "reply-one",
-  userText: "Our recovery marker is MAPLE-73921. Preserve Turkish: dağıtım.",
-  assistantText: "I recorded the recovery marker.",
-  model: "fixture-model",
-  completed: true,
+  mode: "append",
+  exchanges: [firstExchange],
+  startedAt: "2026-11-08T09:00:00.000Z",
+  previous: [],
 };
+
+function exchangeNumber(index: number): BranchExchange {
+  return {
+    user: `user-${index}`,
+    response: `reply-${index}`,
+    turns: [
+      {
+        role: "user",
+        content: `Question ${index}`,
+        timestamp: `2026-11-08T10:00:${String(index).padStart(2, "0")}.000Z`,
+      },
+      {
+        role: "assistant",
+        content: `Answer ${index}`,
+        timestamp: `2026-11-08T10:00:${String(index).padStart(2, "0")}.500Z`,
+      },
+    ],
+  };
+}
 
 function configuration(overrides: Partial<MemoryConfig> = {}): MemoryConfig {
   return {
@@ -199,6 +247,9 @@ beforeEach(async () => {
   conversations = new Map([["convo", {}]]);
   jobs = new Map();
   blockingJobs = [];
+  existingDocuments = new Set();
+  knowledgeTree = { roots: [{ id: "page-one", kind: "page", name: "Decisions" }] };
+  documentProbeStatus = 200;
   directory = await mkdtemp(join(tmpdir(), "hindsight-librechat-"));
   requests = [];
   operations = new Map();
@@ -309,9 +360,21 @@ beforeEach(async () => {
         })
       );
     } else if (path.endsWith("/knowledge-base/tree")) {
-      response.end(
-        JSON.stringify({ roots: [{ id: "page-one", kind: "page", name: "Decisions" }] })
-      );
+      response.end(JSON.stringify(knowledgeTree));
+    } else if (
+      path.includes("/documents/conversation%3A") ||
+      path.includes("/documents/conversation:")
+    ) {
+      const documentId = decodeURIComponent(path.split("/documents/")[1] ?? "");
+      if (documentProbeStatus !== 200) {
+        response.writeHead(documentProbeStatus);
+        response.end(JSON.stringify({ detail: "unavailable" }));
+      } else if (existingDocuments.has(documentId)) {
+        response.end(JSON.stringify({ id: documentId, original_text: "Earlier transcript" }));
+      } else {
+        response.writeHead(404);
+        response.end(JSON.stringify({ detail: "Document not found" }));
+      }
     } else if (path.includes("/documents/")) {
       response.end(JSON.stringify({ id: "document-one", original_text: "Original source text" }));
     } else {
@@ -362,7 +425,59 @@ describe("automatic native lifecycle", () => {
     expect(requests.map((request) => request.path)).toEqual([
       "/v1/default/banks/librechat-private/reflect",
       "/v1/default/banks/librechat-private/memories/recall",
+      "/v1/default/banks/librechat-private/knowledge-base/tree",
     ]);
+  });
+
+  it("frames retrieved memory the extension's way and adds the knowledge-page tool guide", async () => {
+    const instance = await memory();
+    const context = await instance.retrieve(owner, "marker");
+    expect(context.text).toContain("First judge relevance");
+    expect(context.text).toContain("> 🧠 **From Hindsight memory**");
+    expect(context.text).not.toContain("<hindsight-knowledge>");
+    expect(context.guide).toContain("1 knowledge page covers this user's memory");
+    expect(context.guide).toContain("hindsight_search_knowledge_pages(query)");
+    // The page count is cached: a second turn does not re-read the tree.
+    await instance.retrieve(owner, "marker again");
+    expect(
+      requests.filter((request) => request.path.endsWith("/knowledge-base/tree"))
+    ).toHaveLength(1);
+  });
+
+  it("keeps the tool guide out when native tools are off, and still offers it when recall fails", async () => {
+    const withoutTools = await memory({ nativeTools: false });
+    expect((await withoutTools.retrieve(owner, "marker")).guide).toBeUndefined();
+    recallStatus = 503;
+    const failing = await memory();
+    const context = await failing.retrieve(owner, "marker");
+    expect(context.status).toBe("unavailable");
+    expect(context.text).toBe("");
+    expect(context.guide).toContain("<hindsight-knowledge>");
+  });
+
+  it("counts knowledge pages inside folders", async () => {
+    knowledgeTree = {
+      roots: [
+        {
+          id: "folder-one",
+          kind: "folder",
+          name: "People",
+          children: [
+            { id: "page-a", kind: "page", name: "User Profile" },
+            {
+              id: "folder-two",
+              kind: "folder",
+              name: "Work",
+              children: [{ id: "page-b", kind: "page", name: "Current Projects" }],
+            },
+          ],
+        },
+      ],
+    };
+    const instance = await memory();
+    expect((await instance.retrieve(owner, "marker")).guide).toContain(
+      "2 knowledge pages cover this user's memory"
+    );
   });
 
   it("reserves time for recall after a reflection deadline", async () => {
@@ -387,29 +502,141 @@ describe("automatic native lifecycle", () => {
     const instance = await memory();
     expect((await instance.retrieve(actor, "private")).status).toBe("skipped");
     expect(
-      (await instance.capture({ ...exchange, hindsightEnabled: undefined, ...actor })).status
+      (await instance.capture({ ...write, hindsightEnabled: undefined, ...actor })).status
     ).toBe("skipped");
     expect(instance.tools(actor, () => {})).toEqual([]);
     expect(requests).toHaveLength(0);
   });
 
-  it("does not capture an aborted/incomplete answer", async () => {
+  it("does not queue a write without visible text", async () => {
     const instance = await memory();
-    expect((await instance.capture({ ...exchange, completed: false })).status).toBe("skipped");
+    const empty = { ...firstExchange, turns: [] };
+    expect((await instance.capture({ ...write, exchanges: [empty] })).status).toBe("skipped");
+    expect((await instance.capture({ ...write, mode: "replace", exchanges: [empty] })).status).toBe(
+      "skipped"
+    );
     expect((await instance.status()).pending).toBe(0);
   });
 
   it("retains complete user-only exchanges without inventing assistant text", async () => {
     const instance = await memory();
-    await instance.capture({ ...exchange, assistantText: "" });
+    await instance.capture({
+      ...write,
+      exchanges: [{ ...firstExchange, turns: [firstExchange.turns[0]] }],
+    });
     await advance(instance);
-    expect([...operations.values()][0].items[0].content).toBe(`User:\n${exchange.userText}`);
+    expect([...operations.values()][0].items[0].content).toBe(
+      JSON.stringify(firstExchange.turns[0])
+    );
+  });
+
+  it("writes the extension's conversation shape: one document, JSONL turns, conversation strategy", async () => {
+    const instance = await memory();
+    await instance.capture({ ...write, mode: "replace" });
+    await instance.capture({ ...write, exchanges: [exchangeNumber(2)] });
+    // One submission per document per pass: the append follows the replace on the next pass.
+    await advance(instance);
+    await advance(instance);
+    const [replace, append] = [...operations.values()].map((operation) => operation.items[0]);
+    for (const item of [replace, append]) {
+      expect(item.document_id).toBe("conversation:conversation-one");
+      expect(item.strategy).toBe("conversation");
+      expect(item.tags).toEqual(["source:chat", "harness:librechat"]);
+      expect(item.metadata.harness).toBe("librechat");
+      expect(item.timestamp).toBe(write.startedAt);
+      expect(item.context).toContain("assistant turns are the assistant's");
+    }
+    expect(replace.update_mode).toBeUndefined();
+    expect(replace.content.split("\n").map((line) => JSON.parse(line))).toEqual(
+      firstExchange.turns
+    );
+    expect(append.update_mode).toBe("append");
+    expect(append.content.split("\n").map((line) => JSON.parse(line))).toEqual(
+      exchangeNumber(2).turns
+    );
+  });
+
+  it("splits an append into one job per exchange so a re-planned append keeps its identity", async () => {
+    const instance = await memory();
+    const both = await instance.capture({
+      ...write,
+      exchanges: [exchangeNumber(1), exchangeNumber(2)],
+    });
+    const second = await instance.capture({ ...write, exchanges: [exchangeNumber(2)] });
+    expect(both.operationIds).toHaveLength(2);
+    expect(second.operationIds).toEqual([both.operationIds[1]]);
+    expect((await instance.status()).pending).toBe(2);
+  });
+
+  it("gives a replace a new identity when the document held something else before (A → B → A)", async () => {
+    const instance = await memory();
+    const a = await instance.capture({ ...write, mode: "replace" });
+    const back = await instance.capture({
+      ...write,
+      mode: "replace",
+      previous: [{ user: "user-b", response: "reply-b" }],
+    });
+    expect(back.operationIds[0]).not.toBe(a.operationIds[0]);
+  });
+
+  it("submits one document's jobs in the order they were written, behind a stuck earlier job", async () => {
+    operationStatus = "processing";
+    const instance = await memory();
+    loseAcknowledgment = true;
+    await instance.capture({ ...write, exchanges: [exchangeNumber(1)] });
+    await instance.capture({ ...write, exchanges: [exchangeNumber(2)] });
+    await instance.capture({ ...write, conversationId: "conversation-two" });
+    await advance(instance);
+    const submitted = () =>
+      requests
+        .filter((request) => request.path.endsWith("/memories"))
+        .map((request) => (request.body as unknown as RetainBody).items[0]);
+    // The first append lost its acknowledgement: the second waits, another document does not.
+    expect(submitted().map((item) => item.content)).toEqual([
+      expect.stringContaining("Question 1"),
+      expect.stringContaining("MAPLE-73921"),
+    ]);
+    // The retry of the first append goes out; the second waits for the pass after it.
+    await advance(instance);
+    await advance(instance);
+    const order = submitted()
+      .filter((item) => item.document_id === "conversation:conversation-one")
+      .map((item) => item.content.match(/Question \d/)?.[0]);
+    expect(order).toEqual(["Question 1", "Question 1", "Question 2"]);
+  });
+
+  it("drops a document's unsubmitted appends when a replace supersedes them", async () => {
+    const instance = await memory();
+    bankProtected = false;
+    await instance.capture({ ...write, exchanges: [exchangeNumber(1)] });
+    await instance.capture({ ...write, conversationId: "conversation-two" });
+    await instance.capture({
+      ...write,
+      mode: "replace",
+      exchanges: [exchangeNumber(1), exchangeNumber(2)],
+    });
+    expect((await instance.status()).pending).toBe(2);
+    bankProtected = true;
+    await advance(instance);
+    const items = [...operations.values()].map((operation) => operation.items[0]);
+    expect(items.filter((item) => item.update_mode === "append")).toHaveLength(1);
+    expect(items.find((item) => item.update_mode === undefined)?.content).toContain("Question 2");
+  });
+
+  it("reports where each operation stands so the planner can see a blocked append", async () => {
+    operationStatus = "failed";
+    const instance = await memory();
+    const queued = await instance.capture(write);
+    await advance(instance);
+    const states = await instance.operationStates([...queued.operationIds, "never-queued"]);
+    expect(states.get(queued.operationIds[0])).toBe("blocked");
+    expect(states.get("never-queued")).toBe("missing");
   });
 
   it("does not send raw content to an unprotected bank and automatically resumes after protection is enabled", async () => {
     const instance = await memory();
     bankProtected = false;
-    await instance.capture(exchange);
+    await instance.capture(write);
     await advance(instance);
     expect(operations.size).toBe(0);
     expect((await instance.status()).pending).toBe(1);
@@ -429,7 +656,7 @@ describe("automatic native lifecycle", () => {
       () => token
     );
     memories.push(instance);
-    await instance.capture(exchange);
+    await instance.capture(write);
     await advance(instance);
     expect((await instance.status()).pending).toBe(1);
     expect((await instance.status()).blocked).toBe(0);
@@ -444,7 +671,7 @@ describe("automatic native lifecycle", () => {
     operationStatus = "processing";
     const instance = await memory();
     for (let index = 0; index < 40; index++) {
-      await instance.capture({ ...exchange, responseMessageId: `reply-${index}` });
+      await instance.capture({ ...write, conversationId: `conversation-${index}` });
     }
     await advance(instance);
     expect(operations.size).toBe(32);
@@ -455,7 +682,7 @@ describe("automatic native lifecycle", () => {
   it("does not count async submission as completion", async () => {
     operationStatus = "processing";
     const instance = await memory();
-    await instance.capture(exchange);
+    await instance.capture(write);
     await advance(instance);
     expect(await instance.status()).toEqual({ pending: 1, blocked: 0 });
     expect(await readdir(join(directory, "completed"))).toHaveLength(0);
@@ -467,34 +694,18 @@ describe("automatic native lifecycle", () => {
 
   it("deduplicates replayed delivery before and after completion", async () => {
     const instance = await memory();
-    const first = await instance.capture(exchange);
-    const repeated = await instance.capture(exchange);
-    expect(first.operationId).toBe(repeated.operationId);
+    const first = await instance.capture(write);
+    const repeated = await instance.capture(write);
+    expect(first.operationIds).toEqual(repeated.operationIds);
     await advance(instance);
-    expect((await instance.capture(exchange)).status).toBe("completed");
+    expect((await instance.capture(write)).status).toBe("completed");
     expect(operations.size).toBe(1);
-  });
-
-  it("preserves conversation branches, regenerated answers and revised continuations", async () => {
-    const instance = await memory();
-    await instance.capture(exchange);
-    await instance.capture({
-      ...exchange,
-      responseMessageId: "reply-two",
-      assistantText: "An alternate answer",
-    });
-    await instance.capture({ ...exchange, assistantText: "The continued answer" });
-    await advance(instance);
-    expect(operations.size).toBe(3);
-    expect(
-      new Set([...operations.values()].map((operation) => operation.items[0].document_id)).size
-    ).toBe(3);
   });
 
   it("retries a lost acknowledgment using exactly the original operation and payload", async () => {
     const instance = await memory();
     loseAcknowledgment = true;
-    await instance.capture(exchange);
+    await instance.capture(write);
     await advance(instance);
     expect((await instance.status()).pending).toBe(1);
     await advance(instance);
@@ -508,13 +719,13 @@ describe("automatic native lifecycle", () => {
   it("recovers a pending operation across process-instance restarts", async () => {
     operationStatus = "processing";
     const first = await memory();
-    const queued = await first.capture(exchange);
+    const queued = await first.capture(write);
     await advance(first);
     await first.close();
     operationStatus = "completed";
     const second = await memory();
     await advance(second);
-    expect((await second.capture(exchange)).operationId).toBe(queued.operationId);
+    expect((await second.capture(write)).operationIds).toEqual(queued.operationIds);
     expect((await second.status()).pending).toBe(0);
     expect(operations.size).toBe(1);
   });
@@ -522,7 +733,7 @@ describe("automatic native lifecycle", () => {
   it("resubmits an expected missing operation, rather than permanently blocking it", async () => {
     const instance = await memory();
     missingOperation = true;
-    await instance.capture(exchange);
+    await instance.capture(write);
     await advance(instance);
     await advance(instance);
     expect(await instance.status()).toEqual({ pending: 0, blocked: 0 });
@@ -532,7 +743,7 @@ describe("automatic native lifecycle", () => {
   it("keeps terminal failures visible and does not claim or retry them as successful", async () => {
     operationStatus = "failed";
     const instance = await memory();
-    await instance.capture(exchange);
+    await instance.capture(write);
     await advance(instance);
     expect(await instance.status()).toEqual({ pending: 0, blocked: 1 });
     expect(events.some((event) => event.code === "capture_completed")).toBe(false);
@@ -540,8 +751,8 @@ describe("automatic native lifecycle", () => {
 
   it("keeps outbox data private and never persists the backend credential", async () => {
     const instance = await memory();
-    const queued = await instance.capture(exchange);
-    const path = join(directory, "pending", `${queued.operationId}.json`);
+    const queued = await instance.capture(write);
+    const path = join(directory, "pending", `${queued.operationIds[0]}.json`);
     const content = await readFile(path, "utf8");
     expect(content).toContain("MAPLE-73921");
     expect(content).not.toContain("synthetic-adapter-test-token");
@@ -551,7 +762,7 @@ describe("automatic native lifecycle", () => {
 
   it("refuses to reroute persisted work to another bank or owner", async () => {
     const instance = await memory();
-    await instance.capture(exchange);
+    await instance.capture(write);
     await instance.close();
     await expect(memory({ bankId: "another-bank" })).rejects.toThrow("outbox_identity_changed");
   });
@@ -674,7 +885,8 @@ describe("LibreChat native request bridge", () => {
     expect(payload).not.toContain("hidden reasoning");
     expect(payload).not.toContain("tool-result-not-captured");
     expect(payload).not.toContain("data:image");
-    expect(payload).not.toContain("Recalled Hindsight records");
+    expect(payload).not.toContain("hindsight-memory");
+    expect(payload).not.toContain("hindsight-knowledge");
     expect(user.text).toBe("raw user text");
   });
 
@@ -1010,20 +1222,23 @@ describe("LibreChat native request bridge", () => {
     await instance.finalize(
       input,
       {
-        messageId: exchange.userMessageId,
+        messageId: firstExchange.user,
         conversationId: "convo",
-        text: exchange.userText,
+        text: firstExchange.turns[0].content,
       },
       {
-        messageId: exchange.responseMessageId,
+        messageId: firstExchange.response,
         conversationId: "convo",
-        parentMessageId: exchange.userMessageId,
+        parentMessageId: firstExchange.user,
         isCreatedByUser: false,
-        text: exchange.assistantText,
+        text: firstExchange.turns[1].content,
       },
       { unfinished: false, compaction: false, userMetadata: true }
     );
-    expect(requests).toHaveLength(0);
+    // Only the "does this conversation already have a document?" probe: no retrieval.
+    expect(requests.map((request) => request.path)).toEqual([
+      "/v1/default/banks/librechat-private/documents/conversation%3Aconvo",
+    ]);
     expect(
       (await readdir(join(directory, "pending"))).filter((name) => name.endsWith(".json"))
     ).toHaveLength(1);
@@ -1258,18 +1473,23 @@ describe("per-conversation consent", () => {
     const factory = (tool: MemoryTool) => new DynamicStructuredTool(tool);
     instance.attachTools(request, [primary, marked, plain], factory, () => {}, true);
     expect([primary, marked, plain].map((agent) => agent.tools.length)).toEqual([8, 8, 0]);
-    const injected = [primary, marked, plain].map((agent) => {
-      const parts: string[] = [];
-      instance.appendAgentContext(request, agent, context, parts, new Set(), []);
-      return parts.length;
-    });
-    expect(injected).toEqual([1, 1, 0]);
+    const injected = () =>
+      [primary, marked, plain].map((agent) => {
+        const parts: string[] = [];
+        instance.appendAgentContext(request, agent, context, parts, new Set(), []);
+        return parts;
+      });
+    // Memory plus the knowledge-page tool guide for each capable agent with the tools attached.
+    expect(injected().map((parts) => parts.length)).toEqual([2, 2, 0]);
+    expect(injected()[0][1]).toContain("<hindsight-knowledge>");
     expect(await turnRecords()).toEqual([
       expect.objectContaining({ enabled: true, capableAgentIds: ["primary", "marked"] }),
     ]);
 
     instance.attachTools(request, [primary, marked, plain], factory, () => {}, false);
     expect([primary, marked, plain].map((agent) => agent.tools.length)).toEqual([0, 0, 0]);
+    // With the host's tools gate off the guide would name tools the agent does not have.
+    expect(injected().map((parts) => parts.length)).toEqual([1, 1, 0]);
     expect((await instance.prepare(input(request, config)))?.status).toBe("available");
   });
 
@@ -1438,6 +1658,7 @@ describe("per-conversation consent", () => {
             },
             findOneAndUpdate: (...args: Parameters<typeof real.findOneAndUpdate>) =>
               real.findOneAndUpdate(...args),
+            find: (...args: Parameters<typeof real.find>) => real.find(...args),
             insertOne: async (document: Record<string, unknown>) => {
               await real.insertOne(document);
               if (pendingFailure) {
@@ -1734,5 +1955,187 @@ describe("consent toggle", () => {
       status: 503,
       payload: { code: "consent_store_unavailable" },
     });
+  });
+});
+
+describe("conversation documents", () => {
+  const ROOT = "00000000-0000-0000-0000-000000000000";
+  const finished = { unfinished: false, compaction: false };
+  let minute: number;
+
+  beforeEach(() => {
+    minute = 0;
+  });
+
+  /** A message as the host stores it before it finalizes the turn. */
+  function stored(messageId: string, parentMessageId: string, isCreatedByUser: boolean) {
+    return {
+      messageId,
+      parentMessageId,
+      conversationId: "convo",
+      user: "owner",
+      isCreatedByUser,
+      text: `${isCreatedByUser ? "ask" : "answer"} ${messageId}`,
+      createdAt: new Date(Date.UTC(2026, 10, 8, 9, minute++)),
+    };
+  }
+
+  /** One turn through the host's sequence; both messages are saved before finalization. */
+  async function turn(
+    instance: LibreChatMemory,
+    user: ReturnType<typeof stored>,
+    reply: ReturnType<typeof stored>,
+    config = bridgeConfig()
+  ) {
+    const messages = database.collection("messages");
+    for (const message of [user, reply]) {
+      if (!(await messages.findOne({ messageId: message.messageId }))) {
+        await messages.insertOne({ ...message });
+      }
+    }
+    const request = await admitTurn(instance, config, { conversationId: "convo" });
+    const input = { request, user: { id: "owner" }, query: "marker", temporary: false, config };
+    await instance.prepare(input);
+    await instance.finalize(input, user, reply, finished);
+  }
+
+  /** The queued writes, oldest first: with the bank unprotected nothing is submitted. */
+  async function queued() {
+    const names = (await readdir(join(directory, "pending"))).filter((name) =>
+      name.endsWith(".json")
+    );
+    const jobs = await Promise.all(
+      names.map(async (name) =>
+        JSON.parse(await readFile(join(directory, "pending", name), "utf8"))
+      )
+    );
+    return jobs
+      .sort((a, b) => a.sequence - b.sequence)
+      .map((job) => {
+        const item = job.request.items[0];
+        return {
+          documentId: item.document_id as string,
+          mode: (item.update_mode ?? "replace") as string,
+          answers: (item.content as string)
+            .split("\n")
+            .map((line) => JSON.parse(line) as { role: string; content: string })
+            .filter((turn) => turn.role === "assistant")
+            .map((turn) => turn.content.replace("answer ", "")),
+        };
+      });
+  }
+
+  const u1 = () => stored("u1", ROOT, true);
+  const r1 = () => stored("r1", "u1", false);
+  const u2 = () => stored("u2", "r1", true);
+  const r2 = () => stored("r2", "u2", false);
+  const u3 = () => stored("u3", "r2", true);
+  const r3 = () => stored("r3", "u3", false);
+
+  it("keeps a conversation in one document: the first turn starts it, later turns append", async () => {
+    bankProtected = false;
+    const instance = newBridge();
+    await enableConsent(instance);
+    await turn(instance, u1(), r1());
+    await turn(instance, u2(), r2());
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "replace", answers: ["r1"] },
+      { documentId: "conversation:convo", mode: "append", answers: ["r2"] },
+    ]);
+  });
+
+  it("replaces the document with the active branch when an answer is regenerated", async () => {
+    bankProtected = false;
+    const instance = newBridge();
+    await enableConsent(instance);
+    const question = u2();
+    await turn(instance, u1(), r1());
+    await turn(instance, question, r2());
+    await turn(instance, question, stored("r2b", "u2", false));
+    // The replace re-sends the branch, so the unsubmitted writes before it were dropped.
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "replace", answers: ["r1", "r2b"] },
+    ]);
+  });
+
+  it("rebuilds the document when an earlier write was blocked, rather than appending past the gap", async () => {
+    operationStatus = "failed";
+    // A short delivery interval, so the first write is submitted and comes back failed.
+    const config = bridgeConfig({ pollIntervalMs: 20 });
+    const instance = newBridge();
+    await enableConsent(instance);
+    await turn(instance, u1(), r1(), config);
+    await vi.waitFor(async () =>
+      expect((await readdir(join(directory, "blocked"))).length).toBe(1)
+    );
+    bankProtected = false;
+    await turn(instance, u2(), r2(), config);
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "replace", answers: ["r1", "r2"] },
+    ]);
+  });
+
+  it("appends to a document that exists without a record instead of shrinking it", async () => {
+    bankProtected = false;
+    existingDocuments.add("conversation:convo");
+    const instance = newBridge();
+    await enableConsent(instance);
+    await turn(instance, u1(), r1());
+    await turn(instance, u2(), r2());
+    await turn(instance, u2(), stored("r2b", "u2", false));
+    expect((await queued()).map((write) => write.mode)).toEqual(["append", "append", "append"]);
+    expect(await database.collection("hindsighttranscripts").findOne({})).toMatchObject({
+      partial: true,
+    });
+  });
+
+  it("still queues the first exchange when Hindsight cannot be asked whether the document exists", async () => {
+    bankProtected = false;
+    documentProbeStatus = 503;
+    const instance = newBridge();
+    await enableConsent(instance);
+    await turn(instance, u1(), r1());
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "append", answers: ["r1"] },
+    ]);
+    expect(await database.collection("hindsighttranscripts").findOne({})).toMatchObject({
+      partial: true,
+    });
+    expect(events.map((event) => event.code)).toContain("transcript_probe_unavailable");
+  });
+
+  it("replaces the document when a reply is continued under the same message id", async () => {
+    bankProtected = false;
+    const instance = newBridge();
+    await enableConsent(instance);
+    const question = u1();
+    const cut = r1();
+    await turn(instance, question, cut);
+    await database
+      .collection("messages")
+      .updateOne({ messageId: "r1" }, { $set: { text: "answer r1 continued" } });
+    await turn(instance, question, { ...cut, text: "answer r1 continued" });
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "replace", answers: ["r1 continued"] },
+    ]);
+  });
+
+  it("never puts a turn taken while consent was Off into the document", async () => {
+    bankProtected = false;
+    const instance = newBridge();
+    await enableConsent(instance);
+    await turn(instance, u1(), r1());
+    expect(await instance.updateConsent(bridgeConfig(), { id: "owner" }, "convo", false)).toEqual({
+      ok: true,
+      enabled: false,
+    });
+    await turn(instance, u2(), r2());
+    await enableConsent(instance);
+    const question = u3();
+    await turn(instance, question, r3());
+    await turn(instance, question, stored("r3b", "u3", false));
+    expect(await queued()).toEqual([
+      { documentId: "conversation:convo", mode: "replace", answers: ["r1", "r3b"] },
+    ]);
   });
 });

@@ -24,21 +24,12 @@ export interface MemoryActor {
   hindsightEnabled?: boolean;
 }
 
-export interface CompletedExchange extends MemoryActor {
-  conversationId: string;
-  userMessageId: string;
-  responseMessageId: string;
-  userText: string;
-  assistantText: string;
-  model?: string;
-  timestamp?: string;
-  completed: boolean;
-}
-
 export interface MemoryContext {
   text: string;
   status: "available" | "empty" | "unavailable" | "skipped";
   source?: "recall" | "reflect" | "pages";
+  /** The knowledge-page tool guide, for agents that have the read tools attached. */
+  guide?: string;
 }
 
 export interface MemoryEvent {
@@ -57,5 +48,5 @@ export interface QueueStatus {
 
 export interface CaptureResult {
   status: "queued" | "completed" | "skipped";
-  operationId?: string;
+  operationIds: string[];
 }
