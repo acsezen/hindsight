@@ -97,10 +97,20 @@ describe("consent store", () => {
   it("records one immutable decision per turn and returns the first on a retry", async () => {
     const store = await ConsentStore.open(database);
     const turn = { ...key, generation: "1762500000000" };
-    const first = { enabled: true, consentVersion: 3, capableAgentIds: ["agent-one"] };
+    const first = {
+      enabled: true,
+      consentVersion: 3,
+      capableAgentIds: ["agent-one"],
+      basis: "agent" as const,
+    };
     expect(await store.recordTurn(turn, first)).toEqual(first);
     expect(
-      await store.recordTurn(turn, { enabled: false, consentVersion: 4, capableAgentIds: [] })
+      await store.recordTurn(turn, {
+        enabled: false,
+        consentVersion: 4,
+        capableAgentIds: [],
+        basis: "consent",
+      })
     ).toEqual(first);
     expect(await store.readTurn(turn)).toEqual(first);
     expect(await store.readTurn({ ...turn, generation: "1762500000001" })).toBeNull();
@@ -109,6 +119,25 @@ describe("consent store", () => {
       enabled: false,
       consentVersion: 3,
       capableAgentIds: [],
+      basis: "agent",
+    });
+  });
+
+  it("reads a turn recorded before the basis existed as a per-chat consent turn", async () => {
+    const store = await ConsentStore.open(database);
+    const turn = { ...key, generation: "1762500000002" };
+    await database.collection("hindsightturns").insertOne({
+      ...turn,
+      enabled: true,
+      consentVersion: 2,
+      capableAgentIds: ["agent-one"],
+      createdAt: new Date(),
+    });
+    expect(await store.readTurn(turn)).toEqual({
+      enabled: true,
+      consentVersion: 2,
+      capableAgentIds: ["agent-one"],
+      basis: "consent",
     });
   });
 

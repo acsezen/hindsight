@@ -1,7 +1,7 @@
 import { HindsightMemory } from "./adapter.js";
 import { MemoryError } from "./client.js";
 import { ConsentStore, turnGeneration } from "./consent.js";
-import type { ConsentDatabase, ConsentKey, TurnKey, TurnRecord } from "./consent.js";
+import type { ConsentDatabase, ConsentKey, TurnBasis, TurnKey, TurnRecord } from "./consent.js";
 import type { MemoryInspector, MemoryTool, MemoryToolDefinition } from "./tools.js";
 import { conversationDocumentId } from "./records.js";
 import {
@@ -176,6 +176,7 @@ export interface PendingAdmission {
 
 interface Admission {
   enabled: boolean;
+  basis: TurnBasis;
   consentVersion: number;
   key: ConsentKey;
   agents: WeakSet<object>;
@@ -234,6 +235,15 @@ function runtimeAgents(client: AdmissionClient): RuntimeAgent[] {
   );
 }
 
+function addBinding(map: WeakMap<object, WeakSet<object>>, request: object, config: object): void {
+  let bound = map.get(request);
+  if (!bound) {
+    bound = new WeakSet();
+    map.set(request, bound);
+  }
+  bound.add(config);
+}
+
 /** Temporary chats and subagent child threads can never hold consent. */
 function supported(conversation: HostConversation): boolean {
   return conversation.isTemporary !== true && conversation.subagentThread == null;
@@ -264,6 +274,8 @@ export class LibreChatMemory {
   private readonly requestAgents = new WeakMap<object, Map<string, object>>();
   /** Runtime agent configs bound as Hindsight-capable, per request. */
   private readonly bindings = new WeakMap<object, WeakSet<object>>();
+  /** The subset bound by a server-loaded agent's Tool Library entry (never a model chat). */
+  private readonly entryBindings = new WeakMap<object, WeakSet<object>>();
   /** The single consent input for prepare, tools, context and capture. Absent is Off. */
   private readonly admissions = new WeakMap<object, Admission>();
   private store?: Promise<ConsentStore>;
@@ -323,8 +335,11 @@ export class LibreChatMemory {
    *
    * The entry is a Tool Library item, governed like a plugin by LibreChat's
    * `tools` capability: with that capability off the client hides it and it
-   * does nothing here, as the stock loader skips plugin entries. A model chat
-   * never uses the entry and keeps memory; it only loses the read tools.
+   * does nothing here, as the stock loader skips plugin entries. Like any
+   * agent tool it is on in every chat with that agent; only a model chat's
+   * ephemeral primary uses the per-chat switch, even if its tool list (which
+   * can come from the request) names the entry. A model chat keeps memory
+   * without `tools`; it only loses the read tools.
    */
   bindAgent(
     request: object,
@@ -338,12 +353,8 @@ export class LibreChatMemory {
       source.tools.includes(HINDSIGHT_TOOL) &&
       toolsCapability(request);
     if (!ephemeralPrimary && !marked) return;
-    let bound = this.bindings.get(request);
-    if (!bound) {
-      bound = new WeakSet();
-      this.bindings.set(request, bound);
-    }
-    bound.add(config);
+    addBinding(this.bindings, request, config);
+    if (!ephemeralPrimary) addBinding(this.entryBindings, request, config);
   }
 
   /**
@@ -414,8 +425,13 @@ export class LibreChatMemory {
       const capableIds = runtimeAgents(client)
         .filter((agent) => bound?.has(agent) && typeof agent.id === "string")
         .map((agent) => agent.id as string);
+      // A saved agent's entry is on like its other tools; a model chat needs its switch.
+      const basis: TurnBasis =
+        primary != null && this.entryBindings.get(pending.request)?.has(primary) === true
+          ? "agent"
+          : "consent";
       const enabled =
-        decision.enabled &&
+        (basis === "agent" || decision.enabled) &&
         primary != null &&
         bound?.has(primary) === true &&
         client.isCompactionTurn?.() !== true;
@@ -424,6 +440,7 @@ export class LibreChatMemory {
         enabled,
         consentVersion: decision.consentVersion,
         capableAgentIds: enabled ? capableIds : [],
+        basis,
       });
       this.settle(pending.request, decision.key, record, client);
     } catch (error) {
@@ -471,8 +488,13 @@ export class LibreChatMemory {
       }
     }
     const primary = client.options.agent;
+    // An agent-basis record stays on only while the primary still carries the entry.
+    const basisHolds =
+      record.basis !== "agent" ||
+      (primary != null && this.entryBindings.get(request)?.has(primary) === true);
     this.admissions.set(request, {
-      enabled: record.enabled && primary != null && agents.has(primary),
+      enabled: record.enabled && primary != null && agents.has(primary) && basisHolds,
+      basis: record.basis,
       consentVersion: record.consentVersion,
       key: { user: key.user, conversationId: key.conversationId },
       agents,
@@ -692,12 +714,15 @@ export class LibreChatMemory {
     ) {
       throw new MemoryError("capture_conversation_mismatch");
     }
-    // Toggles are refused while a turn is active, so a changed version means a
-    // race or a bug: capture only what was authorized when the turn started.
-    const current = await (await this.consentStore()).read(admission.key);
-    if (current?.enabled !== true || current.version !== admission.consentVersion) {
-      this.report({ code: "capture_skipped_consent_changed" });
-      return;
+    // A model chat's toggles are refused while a turn is active, so a changed
+    // version means a race or a bug: capture only what was authorized when the
+    // turn started. A saved agent's turn does not depend on the switch.
+    if (admission.basis === "consent") {
+      const current = await (await this.consentStore()).read(admission.key);
+      if (current?.enabled !== true || current.version !== admission.consentVersion) {
+        this.report({ code: "capture_skipped_consent_changed" });
+        return;
+      }
     }
     if (response.unfinished === true) return;
     const key = admission.key;
