@@ -117,13 +117,18 @@ interface TurnOptions {
   generation?: unknown;
 }
 
+/** A host request whose app config has LibreChat's `tools` agent capability, as by default. */
+function toolsRequest(capabilities: string[] = ["tools"]): object {
+  return { config: { endpoints: { agents: { capabilities } } } };
+}
+
 /** Drive one turn through the host's sequence: bind, begin admission, admit. */
 async function admitTurn(
   instance: LibreChatMemory,
   config: LibreChatHindsightConfig,
   options: TurnOptions = {}
 ) {
-  const request = options.request ?? {};
+  const request = options.request ?? toolsRequest();
   const primary = options.primary ?? { id: "ephemeral-primary", tools: [] };
   instance.bindAgent(
     request,
@@ -1398,6 +1403,61 @@ describe("per-conversation consent", () => {
     expect(await pendingJobs()).toHaveLength(1);
   });
 
+  it("leaves a saved agent's entry inert while LibreChat's tools capability is off", async () => {
+    const instance = newBridge();
+    const config = bridgeConfig();
+    await enableConsent(instance);
+    const request = toolsRequest(["web_search", "memory"]);
+    const saved: NativeMemoryAgent<DynamicStructuredTool> = { id: "saved", tools: [] };
+    await admitTurn(instance, config, {
+      request,
+      primary: saved,
+      ephemeralPrimary: false,
+      primarySource: { tools: ["web_search", HINDSIGHT_TOOL] },
+    });
+    expect(await instance.prepare(input(request, config))).toBeUndefined();
+    // The host passes its own `tools` gate, which is off as well.
+    instance.attachTools(
+      request,
+      [saved],
+      (tool) => new DynamicStructuredTool(tool),
+      () => {},
+      false
+    );
+    expect(saved.tools).toHaveLength(0);
+    await instance.finalize(input(request, config), userMessage, reply, finished);
+    expect(requests).toEqual([]);
+    expect(await pendingJobs()).toEqual([]);
+    expect(await turnRecords()).toEqual([
+      expect.objectContaining({ enabled: false, capableAgentIds: [] }),
+    ]);
+  });
+
+  it("keeps a model chat's memory without the tools capability, only without the read tools", async () => {
+    const instance = newBridge();
+    const config = bridgeConfig();
+    await enableConsent(instance);
+    const request = toolsRequest(["web_search"]);
+    const primary: NativeMemoryAgent<DynamicStructuredTool> = { id: "primary", tools: [] };
+    await admitTurn(instance, config, { request, primary });
+    const context = await instance.prepare(input(request, config));
+    expect(context?.status).toBe("available");
+    instance.attachTools(
+      request,
+      [primary],
+      (tool) => new DynamicStructuredTool(tool),
+      () => {},
+      false
+    );
+    expect(primary.tools).toHaveLength(0);
+    const parts: string[] = [];
+    instance.appendAgentContext(request, primary, context, parts, new Set(), []);
+    // Memory only: no tool guide naming tools the agent does not have.
+    expect(parts).toHaveLength(1);
+    await instance.finalize(input(request, config), userMessage, reply, finished);
+    expect(await pendingJobs()).toHaveLength(1);
+  });
+
   it.each([{ user: { id: "not-owner" } }, { temporary: true }, { interactive: false }])(
     "never reads or writes consent for an excluded turn: %j",
     async (options) => {
@@ -1531,7 +1591,7 @@ describe("per-conversation consent", () => {
     });
 
     // After restart: new runtime configs; "marked" lost the tool, "added" gained it.
-    const resumed = {};
+    const resumed = toolsRequest();
     const primary = { id: "primary" };
     const lost = { id: "marked" };
     const gained = { id: "gained" };

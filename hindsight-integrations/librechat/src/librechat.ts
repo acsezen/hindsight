@@ -57,6 +57,18 @@ function withCaptured(captured: ExchangeId[], current: ExchangeId): ExchangeId[]
 /** The `agent.tools` entry that makes a saved agent Hindsight-capable. Never a model tool. */
 export const HINDSIGHT_TOOL = "hindsight";
 
+/**
+ * Whether LibreChat's generic `tools` agent capability is on for this request: the same
+ * `req.config.endpoints.agents.capabilities` list the host gates the read tools on. LibreChat
+ * fills in its default capabilities when the YAML omits the key, so an absent list means off.
+ */
+function toolsCapability(request: object): boolean {
+  const capabilities = (
+    request as { config?: { endpoints?: { agents?: { capabilities?: unknown } } } }
+  ).config?.endpoints?.agents?.capabilities;
+  return Array.isArray(capabilities) && capabilities.includes("tools");
+}
+
 export interface LibreChatHindsightConfig extends Omit<MemoryConfig, "apiKey"> {
   enabled: boolean;
   apiKeyEnv?: string;
@@ -308,6 +320,11 @@ export class LibreChatMemory {
    * Record whether a runtime agent config may use Hindsight this run. Only a
    * model chat's ephemeral primary or a server-loaded agent carrying the
    * `hindsight` tool entry qualifies; anything never bound is excluded.
+   *
+   * The entry is a Tool Library item, governed like a plugin by LibreChat's
+   * `tools` capability: with that capability off the client hides it and it
+   * does nothing here, as the stock loader skips plugin entries. A model chat
+   * never uses the entry and keeps memory; it only loses the read tools.
    */
   bindAgent(
     request: object,
@@ -316,7 +333,10 @@ export class LibreChatMemory {
     ephemeralPrimary = false
   ): void {
     if (config == null) return;
-    const marked = Array.isArray(source?.tools) && source.tools.includes(HINDSIGHT_TOOL);
+    const marked =
+      Array.isArray(source?.tools) &&
+      source.tools.includes(HINDSIGHT_TOOL) &&
+      toolsCapability(request);
     if (!ephemeralPrimary && !marked) return;
     let bound = this.bindings.get(request);
     if (!bound) {
