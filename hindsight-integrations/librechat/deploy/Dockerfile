@@ -6,7 +6,7 @@
 ARG LIBRECHAT_IMAGE=registry.librechat.ai/librechat-ai/librechat-api@sha256:9cde97da2b504adc90b8b01b606697f1fd6d71e2152345060133c7b41bfabc21
 ARG LIBRECHAT_SOURCE_COMMIT=e8f3be08623663d4ad7f7241e693c94469b63bb0
 ARG LIBRECHAT_SOURCE_SHA256=e658669f118b777be82807299d6f1b48a7f65bc48d191c19684eb55bb9f59420
-ARG CLIENT_PATCH_SHA256=41ad63a77efd6b5b7e5ac9c0f84536ca49868f0f217b5f8fdcf33d76b3356262
+ARG CLIENT_PATCH_SHA256=0715e355c07721e13fff7d0d2268fe426f836b9e45b28954432eea4157d2522d
 
 # The per-chat Hindsight controls live in the browser bundle, which the pinned
 # image ships prebuilt. Rebuild only client/dist from that image's own source
