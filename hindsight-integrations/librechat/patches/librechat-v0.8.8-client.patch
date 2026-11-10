@@ -1,5 +1,5 @@
 diff --git a/client/src/components/Chat/Input/ChatForm.tsx b/client/src/components/Chat/Input/ChatForm.tsx
-index 17fc2c92f..7711db382 100644
+index 17fc2c92f..db356ead0 100644
 --- a/client/src/components/Chat/Input/ChatForm.tsx
 +++ b/client/src/components/Chat/Input/ChatForm.tsx
 @@ -39,6 +39,7 @@ import {
@@ -18,7 +18,7 @@ index 17fc2c92f..7711db382 100644
  import BadgeRow from './BadgeRow';
  import Mention from './Mention';
  import store from '~/store';
-@@ -876,6 +878,15 @@ const ChatForm = memo(function ChatForm({
+@@ -876,6 +878,14 @@ const ChatForm = memo(function ChatForm({
                      Array.isArray(conversation?.messages) && conversation.messages.length >= 1
                    }
                  />
@@ -26,7 +26,6 @@ index 17fc2c92f..7711db382 100644
 +                  <Hindsight
 +                    conversationId={conversationId}
 +                    kind={hindsightKind(endpoint)}
-+                    agentId={conversation?.agent_id}
 +                    hidden={hideBadgeRow}
 +                    isSubmitting={isSubmitting}
 +                  />
@@ -348,14 +347,14 @@ index 8424dd295..608bf68f3 100644
        applyModelSpecEffects,
      ],
 diff --git a/client/src/locales/en/translation.json b/client/src/locales/en/translation.json
-index 2d81936fa..cde722aa4 100644
+index 2d81936fa..73b0a4fba 100644
 --- a/client/src/locales/en/translation.json
 +++ b/client/src/locales/en/translation.json
 @@ -196,6 +196,7 @@
    "com_agents_file_context_label": "File Context",
    "com_agents_file_search_disabled": "Agent must be created before uploading files for File Search.",
    "com_agents_file_search_info": "Turns uploaded files into a searchable knowledge base. The agent retrieves the most relevant passages on demand, so it works well even with large document sets.",
-+  "com_agents_hindsight_info": "Lets this agent use your private Hindsight memory in chats where you switch Hindsight on. Every chat starts with it off.",
++  "com_agents_hindsight_info": "Recalls your private Hindsight memory and saves every chat with this agent to it. Use a temporary chat to keep a conversation out.",
    "com_agents_grid_announcement": "Showing {{count}} agents in {{category}} category",
    "com_agents_instructions_placeholder": "The system instructions that the agent uses",
    "com_agents_link_copied": "Link copied",
@@ -488,10 +487,10 @@ index 681188237..5bc712941 100644
 +export type THindsightConsentUpdate = { enabled: boolean };
 diff --git a/client/src/components/Chat/Input/Hindsight.tsx b/client/src/components/Chat/Input/Hindsight.tsx
 new file mode 100644
-index 000000000..286d6d75e
+index 000000000..ee689adc6
 --- /dev/null
 +++ b/client/src/components/Chat/Input/Hindsight.tsx
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,66 @@
 +import React, { memo, useEffect } from 'react';
 +import { useSetAtom } from 'jotai';
 +import { History } from 'lucide-react';
@@ -508,17 +507,18 @@ index 000000000..286d6d75e
 +}
 +
 +/**
-+ * Per-chat Hindsight memory switch. Model chats switch it from the Tools menu
-+ * and show it while On; saved-agent chats have no Tools menu, so there it is
-+ * always shown. A plain switch rather than `CheckboxButton`, whose internal
-+ * store flips on click before the server confirms the change. Only this
-+ * rendered control can confirm On for a submission.
++ * A model chat's per-chat Hindsight memory switch: turned on from the Tools
++ * menu and shown while On, like LibreChat's other model-chat tool badges.
++ * Saved agents have none (their Tool Library entry is always on). A plain
++ * switch rather than `CheckboxButton`, whose internal store flips on click
++ * before the server confirms the change. Only this rendered control can
++ * confirm On for a submission.
 + */
 +function Hindsight({ isSubmitting, ...surface }: HindsightProps) {
 +  const localize = useLocalize();
 +  const setAcknowledged = useSetAtom(hindsightAcknowledgedAtom);
 +  const { key, shown, enabled, pending, unconfirmed, setEnabled } = useHindsightConsent(surface);
-+  const visible = shown && (surface.kind === 'agent' || enabled || pending);
++  const visible = shown && (enabled || pending);
 +  const acknowledged = visible && enabled && !pending;
 +
 +  useEffect(() => {
@@ -652,47 +652,41 @@ index 000000000..028b7be91
 +}
 diff --git a/client/src/hooks/Hindsight/useHindsightConsent.ts b/client/src/hooks/Hindsight/useHindsightConsent.ts
 new file mode 100644
-index 000000000..4af477cd7
+index 000000000..fc2cf552b
 --- /dev/null
 +++ b/client/src/hooks/Hindsight/useHindsightConsent.ts
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,101 @@
 +import { useCallback } from 'react';
 +import { useAtom } from 'jotai';
 +import { useRecoilValue } from 'recoil';
 +import { useToastContext } from '@librechat/client';
++import { Constants, isAgentsEndpoint, isAssistantsEndpoint } from 'librechat-data-provider';
 +import {
-+  Constants,
-+  AgentCapabilities,
-+  isAgentsEndpoint,
-+  isAssistantsEndpoint,
-+} from 'librechat-data-provider';
-+import {
-+  useGetAgentByIdQuery,
 +  useHindsightConsentQuery,
 +  useHindsightConsentChanging,
 +  useHindsightAvailabilityQuery,
 +  useUpdateHindsightConsentMutation,
 +} from '~/data-provider';
 +import { hindsightDraftAtom } from '~/store/hindsight';
-+import { useGetAgentsConfig, useLocalize } from '~/hooks';
++import { useLocalize } from '~/hooks';
 +import store from '~/store';
 +
-+/** The Tool Library entry that makes a saved agent Hindsight-capable. */
-+const HINDSIGHT_TOOL = 'hindsight';
-+
-+/** Which composer surface an endpoint is: saved agents, plain model chats, or unsupported. */
++/**
++ * Only plain model chats have the per-chat switch. A saved agent's Hindsight
++ * is its Tool Library entry, on in every chat like its other tools, so agent
++ * chats (like assistants) have no composer control.
++ */
 +export function hindsightKind(endpoint?: string | null): HindsightSurface['kind'] {
-+  if (!endpoint || isAssistantsEndpoint(endpoint)) {
++  if (!endpoint || isAssistantsEndpoint(endpoint) || isAgentsEndpoint(endpoint)) {
 +    return null;
 +  }
-+  return isAgentsEndpoint(endpoint) ? 'agent' : 'model';
++  return 'model';
 +}
 +
 +export interface HindsightSurface {
 +  conversationId?: string | null;
-+  /** `model` for plain model chats, `agent` for saved agents, null where unsupported. */
-+  kind: 'model' | 'agent' | null;
-+  agentId?: string | null;
++  /** `model` for plain model chats, null where the composer has no switch. */
++  kind: 'model' | null;
 +  /** Model specs that hide the badge row never show the control. */
 +  hidden: boolean;
 +}
@@ -702,12 +696,7 @@ index 000000000..4af477cd7
 + * server-confirmed value; a new chat holds its own in-memory draft until its
 + * first message. The server makes the final decision either way.
 + */
-+export default function useHindsightConsent({
-+  conversationId,
-+  kind,
-+  agentId,
-+  hidden,
-+}: HindsightSurface) {
++export default function useHindsightConsent({ conversationId, kind, hidden }: HindsightSurface) {
 +  const localize = useLocalize();
 +  const { showToast } = useToastContext();
 +  const isTemporary = useRecoilValue(store.isTemporary);
@@ -716,16 +705,7 @@ index 000000000..4af477cd7
 +  const isNew = key === Constants.NEW_CONVO;
 +  const availability = useHindsightAvailabilityQuery();
 +  const available = availability.data?.available === true;
-+  const eligible = available && kind != null && !hidden && !isTemporary;
-+  const agent = useGetAgentByIdQuery(agentId, {
-+    enabled: eligible && kind === 'agent' && !!agentId,
-+  });
-+  const { agentsConfig } = useGetAgentsConfig();
-+  /** Like a plugin, the agent entry follows the `tools` capability; the server applies the same gate. */
-+  const toolsEnabled = agentsConfig?.capabilities?.includes(AgentCapabilities.tools) === true;
-+  const capable =
-+    kind === 'agent' ? toolsEnabled && agent.data?.tools?.includes(HINDSIGHT_TOOL) === true : true;
-+  const supported = eligible && capable;
++  const supported = available && kind != null && !hidden && !isTemporary;
 +  const consent = useHindsightConsentQuery(key, supported && !isNew);
 +  const mutation = useUpdateHindsightConsentMutation(key);
 +  /** Shared by every control: a change started from the Tools menu also holds the badge. */
