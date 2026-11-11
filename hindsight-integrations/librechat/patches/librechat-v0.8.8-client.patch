@@ -34,11 +34,12 @@ index 17fc2c92f..db356ead0 100644
                    conversation={conversation}
                    addedConversation={addedConvo}
 diff --git a/client/src/components/Chat/Input/ToolsDropdown.tsx b/client/src/components/Chat/Input/ToolsDropdown.tsx
-index 64fc779bb..015dc11c6 100644
+index 64fc779bb..d5f8b85d2 100644
 --- a/client/src/components/Chat/Input/ToolsDropdown.tsx
 +++ b/client/src/components/Chat/Input/ToolsDropdown.tsx
-@@ -1,7 +1,15 @@
+@@ -1,7 +1,16 @@
  import React, { useState, useMemo, useCallback } from 'react';
++import { useAtom } from 'jotai';
  import * as Ariakit from '@ariakit/react';
  import { TooltipAnchor, DropdownPopup, PinIcon, VectorIcon } from '@librechat/client';
 -import { Brain, Globe, ScrollText, Settings, Settings2, TerminalSquareIcon } from 'lucide-react';
@@ -54,15 +55,16 @@ index 64fc779bb..015dc11c6 100644
  import {
    AuthType,
    Permissions,
-@@ -17,6 +25,7 @@ import {
+@@ -17,6 +26,8 @@ import {
    useHasMemoryAccess,
    useAgentCapabilities,
  } from '~/hooks';
 +import useHindsightConsent from '~/hooks/Hindsight/useHindsightConsent';
++import { hindsightPinnedAtom } from '~/store/hindsight';
  import ArtifactsSubMenu from '~/components/Chat/Input/ArtifactsSubMenu';
  import MCPSubMenu from '~/components/Chat/Input/MCPSubMenu';
  import { useGetStartupConfig } from '~/data-provider';
-@@ -73,6 +82,12 @@ const ToolsDropdown = ({ disabled }: ToolsDropdownProps) => {
+@@ -73,6 +84,14 @@ const ToolsDropdown = ({ disabled }: ToolsDropdownProps) => {
  
    const canUseMemory = useHasMemoryAccess();
    const showMemory = canUseMemory && memoryEnabled && user?.personalization?.memories !== false;
@@ -72,10 +74,12 @@ index 64fc779bb..015dc11c6 100644
 +    kind: 'model',
 +    hidden: false,
 +  });
++  /** Pinned keeps the Hindsight badge in the composer while Off, like the other tools' pins. */
++  const [isHindsightPinned, setIsHindsightPinned] = useAtom(hindsightPinnedAtom);
  
    const [isPopoverActive, setIsPopoverActive] = useState(false);
    const isDisabled = disabled ?? false;
-@@ -312,6 +327,25 @@ const ToolsDropdown = ({ disabled }: ToolsDropdownProps) => {
+@@ -312,6 +331,39 @@ const ToolsDropdown = ({ disabled }: ToolsDropdownProps) => {
      });
    }
  
@@ -90,9 +94,23 @@ index 64fc779bb..015dc11c6 100644
 +            <History className="icon-md" aria-hidden="true" />
 +            <span>{localize('com_ui_hindsight')}</span>
 +          </div>
-+          <span className="text-xs text-text-secondary" aria-live="polite">
-+            {localize(hindsight.enabled ? 'com_ui_on' : 'com_ui_off')}
-+          </span>
++          <button
++            type="button"
++            onClick={(e) => {
++              e.stopPropagation();
++              setIsHindsightPinned(!isHindsightPinned);
++            }}
++            className={cn(
++              'rounded p-1 transition-all duration-200',
++              'hover:bg-surface-secondary hover:shadow-sm',
++              !isHindsightPinned && 'text-text-secondary hover:text-text-primary',
++            )}
++            aria-label={isHindsightPinned ? 'Unpin' : 'Pin'}
++          >
++            <div className="h-4 w-4">
++              <PinIcon unpin={isHindsightPinned} />
++            </div>
++          </button>
 +        </div>
 +      ),
 +    });
@@ -487,17 +505,17 @@ index 681188237..5bc712941 100644
 +export type THindsightConsentUpdate = { enabled: boolean };
 diff --git a/client/src/components/Chat/Input/Hindsight.tsx b/client/src/components/Chat/Input/Hindsight.tsx
 new file mode 100644
-index 000000000..ee689adc6
+index 000000000..c5c55f9c5
 --- /dev/null
 +++ b/client/src/components/Chat/Input/Hindsight.tsx
-@@ -0,0 +1,66 @@
+@@ -0,0 +1,68 @@
 +import React, { memo, useEffect } from 'react';
-+import { useSetAtom } from 'jotai';
++import { useAtomValue, useSetAtom } from 'jotai';
 +import { History } from 'lucide-react';
 +import { composerControlClasses } from '@librechat/client';
 +import type { HindsightSurface } from '~/hooks/Hindsight/useHindsightConsent';
 +import useHindsightConsent from '~/hooks/Hindsight/useHindsightConsent';
-+import { hindsightAcknowledgedAtom } from '~/store/hindsight';
++import { hindsightAcknowledgedAtom, hindsightPinnedAtom } from '~/store/hindsight';
 +import { badgeAccents } from './accents';
 +import { useLocalize } from '~/hooks';
 +import { cn } from '~/utils';
@@ -508,7 +526,8 @@ index 000000000..ee689adc6
 +
 +/**
 + * A model chat's per-chat Hindsight memory switch: turned on from the Tools
-+ * menu and shown while On, like LibreChat's other model-chat tool badges.
++ * menu and shown while On or pinned, like LibreChat's other model-chat tool
++ * badges.
 + * Saved agents have none (their Tool Library entry is always on). A plain
 + * switch rather than `CheckboxButton`, whose internal store flips on click
 + * before the server confirms the change. Only this rendered control can
@@ -517,8 +536,9 @@ index 000000000..ee689adc6
 +function Hindsight({ isSubmitting, ...surface }: HindsightProps) {
 +  const localize = useLocalize();
 +  const setAcknowledged = useSetAtom(hindsightAcknowledgedAtom);
++  const pinned = useAtomValue(hindsightPinnedAtom);
 +  const { key, shown, enabled, pending, unconfirmed, setEnabled } = useHindsightConsent(surface);
-+  const visible = shown && (enabled || pending);
++  const visible = shown && (enabled || pending || pinned);
 +  const acknowledged = visible && enabled && !pending;
 +
 +  useEffect(() => {
@@ -759,11 +779,12 @@ index 000000000..fc2cf552b
 +}
 diff --git a/client/src/store/hindsight.ts b/client/src/store/hindsight.ts
 new file mode 100644
-index 000000000..9522180cd
+index 000000000..c23594720
 --- /dev/null
 +++ b/client/src/store/hindsight.ts
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,25 @@
 +import { atom } from 'jotai';
++import { createStorageAtom } from './jotai-utils';
 +
 +/**
 + * A new chat's own Hindsight choice before its first message. In memory only:
@@ -777,3 +798,13 @@ index 000000000..9522180cd
 + * any. Submissions send `hindsightMemory: true` only for that conversation.
 + */
 +export const hindsightAcknowledgedAtom = atom<string | null>(null);
++
++/**
++ * Whether the Hindsight badge stays in the composer while Off, set from the
++ * Tools menu pin like the other model-chat tools (`LAST_<TOOL>_TOGGLE_pinned`).
++ * A display preference only: it never turns Hindsight on for a chat.
++ */
++export const hindsightPinnedAtom = createStorageAtom<boolean>(
++  'LAST_HINDSIGHT_TOGGLE_pinned',
++  false,
++);
