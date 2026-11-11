@@ -1295,7 +1295,7 @@ describe("LibreChat native request bridge", () => {
   });
 });
 
-describe("per-conversation consent", () => {
+describe("turn admission: saved agents and per-chat consent", () => {
   const userMessage = {
     messageId: "user-one",
     conversationId: "convo",
@@ -1378,29 +1378,128 @@ describe("per-conversation consent", () => {
     }
   );
 
-  it("uses Hindsight on a saved agent only when its server-loaded tools carry the marker", async () => {
+  /** A saved agent's turn as the host sends it: no switch on the page, so no flag. */
+  const savedAgent = (tools: unknown[], extra: TurnOptions = {}): TurnOptions => ({
+    primary: { id: "saved", tools: [] },
+    ephemeralPrimary: false,
+    primarySource: { tools },
+    acknowledged: undefined,
+    ...extra,
+  });
+
+  it("is on in every chat with a saved agent carrying the entry, like the agent's other tools", async () => {
+    const instance = newBridge();
+    const config = bridgeConfig();
+    const { context, agent } = await runTurn(
+      instance,
+      config,
+      savedAgent(["web_search", HINDSIGHT_TOOL])
+    );
+    expect(context?.status).toBe("available");
+    expect(agent.tools).toHaveLength(8);
+    expect(await pendingJobs()).toHaveLength(1);
+    expect(await turnRecords()).toEqual([
+      expect.objectContaining({ enabled: true, basis: "agent", capableAgentIds: ["saved"] }),
+    ]);
+    // The per-chat switch is not involved: nothing is stored On for the chat.
+    expect(await database.collection("hindsightconsents").countDocuments({ enabled: true })).toBe(
+      0
+    );
+  });
+
+  it("keeps a saved agent without the entry Off, even when the chat's switch was On", async () => {
+    const instance = newBridge();
+    await enableConsent(instance);
+    const { context, agent } = await runTurn(
+      instance,
+      bridgeConfig(),
+      savedAgent(["web_search"], { acknowledged: true })
+    );
+    expect(context).toBeUndefined();
+    expect(agent.tools).toHaveLength(0);
+    expect(requests).toEqual([]);
+    expect(await pendingJobs()).toEqual([]);
+    expect(await turnRecords()).toEqual([
+      expect.objectContaining({ enabled: false, basis: "consent", capableAgentIds: [] }),
+    ]);
+  });
+
+  it("never lets a model chat skip its switch through a tool list naming the entry", async () => {
+    const instance = newBridge();
+    const { context } = await runTurn(instance, bridgeConfig(), {
+      primarySource: { tools: [HINDSIGHT_TOOL] },
+      ephemeralPrimary: true,
+    });
+    expect(context).toBeUndefined();
+    expect(requests).toEqual([]);
+    expect(await turnRecords()).toEqual([
+      expect.objectContaining({ enabled: false, basis: "consent" }),
+    ]);
+  });
+
+  it.each([{ user: { id: "not-owner" } }, { temporary: true }, { interactive: false }])(
+    "keeps a saved agent's excluded turn Off: %j",
+    async (options) => {
+      const instance = newBridge();
+      const { context } = await runTurn(
+        instance,
+        bridgeConfig(),
+        savedAgent([HINDSIGHT_TOOL], options)
+      );
+      expect(context).toBeUndefined();
+      expect(await turnRecords()).toEqual([]);
+      expect(requests).toEqual([]);
+    }
+  );
+
+  it("captures a saved agent's turn whatever the chat's switch does meanwhile", async () => {
     const instance = newBridge();
     const config = bridgeConfig();
     await enableConsent(instance);
-    const plain = await runTurn(instance, config, {
-      primary: { id: "saved", tools: [] },
-      ephemeralPrimary: false,
-      primarySource: { tools: ["web_search"] },
-    });
-    expect(plain.context).toBeUndefined();
-    expect(plain.agent.tools).toHaveLength(0);
-    expect(requests).toEqual([]);
-    expect(await turnRecords()).toEqual([
-      expect.objectContaining({ enabled: false, capableAgentIds: [] }),
-    ]);
-    const capable = await runTurn(instance, config, {
-      primary: { id: "saved", tools: [] },
-      ephemeralPrimary: false,
-      primarySource: { tools: ["web_search", HINDSIGHT_TOOL] },
-    });
-    expect(capable.context?.status).toBe("available");
-    expect(capable.agent.tools).toHaveLength(8);
+    const request = await admitTurn(instance, config, savedAgent([HINDSIGHT_TOOL]));
+    await instance.prepare(input(request, config));
+    await database
+      .collection("hindsightconsents")
+      .updateOne({ conversationId: "convo" }, { $set: { enabled: false }, $inc: { version: 1 } });
+    await instance.finalize(input(request, config), userMessage, reply, finished);
     expect(await pendingJobs()).toHaveLength(1);
+    expect(events.map((event) => event.code)).not.toContain("capture_skipped_consent_changed");
+  });
+
+  it("resumes a saved agent's turn from its record only while the agent still carries the entry", async () => {
+    const instance = newBridge();
+    const config = bridgeConfig();
+    const turn = 1762500888888;
+    await admitTurn(instance, config, savedAgent([HINDSIGHT_TOOL], { generation: turn }));
+    const resume = async (
+      primary: object,
+      source: { tools: unknown[] } | null,
+      ephemeral = false
+    ) => {
+      const request = toolsRequest();
+      instance.bindAgent(request, primary, source, ephemeral);
+      await instance.restore(
+        {
+          request,
+          config,
+          user: { id: "owner" },
+          conversationId: "convo",
+          generation: turn,
+          temporary: false,
+        },
+        runClient(primary)
+      );
+      return request;
+    };
+    const kept = await resume({ id: "saved" }, { tools: [HINDSIGHT_TOOL] });
+    expect((await instance.prepare(input(kept, config)))?.status).toBe("available");
+    await instance.finalize(input(kept, config), userMessage, reply, finished);
+    expect(await pendingJobs()).toHaveLength(1);
+    // The same id bound as a model chat's primary cannot inherit the agent basis.
+    const asModelChat = await resume({ id: "saved" }, null, true);
+    expect(await instance.prepare(input(asModelChat, config))).toBeUndefined();
+    const removed = await resume({ id: "saved" }, { tools: [] });
+    expect(await instance.prepare(input(removed, config))).toBeUndefined();
   });
 
   it("leaves a saved agent's entry inert while LibreChat's tools capability is off", async () => {

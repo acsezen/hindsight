@@ -48,10 +48,18 @@ export interface ConsentState {
   fence: number;
 }
 
+/**
+ * Why a turn was admitted: `agent` for a saved agent carrying the Hindsight
+ * Tool Library entry (on, like any agent tool), `consent` for a model chat's
+ * per-chat switch. Records written before the basis existed are `consent`.
+ */
+export type TurnBasis = "agent" | "consent";
+
 export interface TurnRecord {
   enabled: boolean;
   consentVersion: number;
   capableAgentIds: string[];
+  basis: TurnBasis;
 }
 
 export type ConsentChange = "changed" | "unchanged" | "conflict";
@@ -66,12 +74,19 @@ const turnRow = z.object({
   enabled: z.boolean(),
   consentVersion: z.number().int().nonnegative(),
   capableAgentIds: z.array(z.string()),
+  basis: z.enum(["agent", "consent"]).default("consent"),
 });
 
 const consentProjection = { _id: 0, enabled: 1, version: 1, fence: 1 } as const;
-const turnProjection = { _id: 0, enabled: 1, consentVersion: 1, capableAgentIds: 1 } as const;
+const turnProjection = {
+  _id: 0,
+  enabled: 1,
+  consentVersion: 1,
+  capableAgentIds: 1,
+  basis: 1,
+} as const;
 
-function parse<T>(schema: z.ZodType<T>, value: unknown): T | null {
+function parse<T>(schema: z.ZodType<T, z.ZodTypeDef, unknown>, value: unknown): T | null {
   if (value == null) return null;
   const parsed = schema.safeParse(value);
   if (!parsed.success) throw new MemoryError("consent_record_invalid");
@@ -228,6 +243,7 @@ export class ConsentStore {
         enabled: record.enabled,
         consentVersion: record.consentVersion,
         capableAgentIds: record.capableAgentIds,
+        basis: record.basis,
         createdAt: new Date(),
       });
       return record;
