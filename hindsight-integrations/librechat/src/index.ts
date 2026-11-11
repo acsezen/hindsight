@@ -1,5 +1,7 @@
 export { HindsightMemory } from "./adapter.js";
 export { MemoryError } from "./client.js";
+export { memoryLogEntry } from "./events.js";
+export type { MemoryLogEntry } from "./events.js";
 export { HINDSIGHT_TOOL, LibreChatMemory } from "./librechat.js";
 export { visibleText } from "./transcript.js";
 export { consentHandlers } from "./routes.js";

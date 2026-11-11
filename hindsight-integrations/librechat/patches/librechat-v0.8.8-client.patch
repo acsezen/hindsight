@@ -144,7 +144,7 @@ index ad7824813..1692f2323 100644
        builtinAuthMap,
      ],
 diff --git a/client/src/components/SidePanel/Agents/Tools/items/catalog.ts b/client/src/components/SidePanel/Agents/Tools/items/catalog.ts
-index 6080c9c31..a16f04909 100644
+index 6080c9c31..aed6615cb 100644
 --- a/client/src/components/SidePanel/Agents/Tools/items/catalog.ts
 +++ b/client/src/components/SidePanel/Agents/Tools/items/catalog.ts
 @@ -56,6 +56,11 @@ export interface BuildCatalogInputs {
@@ -159,11 +159,12 @@ index 6080c9c31..a16f04909 100644
    /**
     * Whether `web_search` uses USER_PROVIDED auth (a user-managed key). Drives the
     * cog-vs-info affordance on the web_search card/row: configurable only when a
-@@ -173,6 +178,16 @@ export function buildCatalog(inputs: BuildCatalogInputs): AgentItem[] {
+@@ -173,6 +178,17 @@ export function buildCatalog(inputs: BuildCatalogInputs): AgentItem[] {
      });
    }
  
-+  if (inputs.showHindsight) {
++  /** Like a plugin, the entry follows the generic `tools` capability; the server applies the same gate. */
++  if (inputs.showHindsight && enabled.has(AgentCapabilities.tools)) {
 +    items.push({
 +      kind: 'builtin',
 +      id: 'hindsight',
@@ -651,15 +652,20 @@ index 000000000..028b7be91
 +}
 diff --git a/client/src/hooks/Hindsight/useHindsightConsent.ts b/client/src/hooks/Hindsight/useHindsightConsent.ts
 new file mode 100644
-index 000000000..4354256df
+index 000000000..4af477cd7
 --- /dev/null
 +++ b/client/src/hooks/Hindsight/useHindsightConsent.ts
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,121 @@
 +import { useCallback } from 'react';
 +import { useAtom } from 'jotai';
 +import { useRecoilValue } from 'recoil';
 +import { useToastContext } from '@librechat/client';
-+import { Constants, isAgentsEndpoint, isAssistantsEndpoint } from 'librechat-data-provider';
++import {
++  Constants,
++  AgentCapabilities,
++  isAgentsEndpoint,
++  isAssistantsEndpoint,
++} from 'librechat-data-provider';
 +import {
 +  useGetAgentByIdQuery,
 +  useHindsightConsentQuery,
@@ -668,7 +674,7 @@ index 000000000..4354256df
 +  useUpdateHindsightConsentMutation,
 +} from '~/data-provider';
 +import { hindsightDraftAtom } from '~/store/hindsight';
-+import { useLocalize } from '~/hooks';
++import { useGetAgentsConfig, useLocalize } from '~/hooks';
 +import store from '~/store';
 +
 +/** The Tool Library entry that makes a saved agent Hindsight-capable. */
@@ -714,7 +720,11 @@ index 000000000..4354256df
 +  const agent = useGetAgentByIdQuery(agentId, {
 +    enabled: eligible && kind === 'agent' && !!agentId,
 +  });
-+  const capable = kind === 'agent' ? agent.data?.tools?.includes(HINDSIGHT_TOOL) === true : true;
++  const { agentsConfig } = useGetAgentsConfig();
++  /** Like a plugin, the agent entry follows the `tools` capability; the server applies the same gate. */
++  const toolsEnabled = agentsConfig?.capabilities?.includes(AgentCapabilities.tools) === true;
++  const capable =
++    kind === 'agent' ? toolsEnabled && agent.data?.tools?.includes(HINDSIGHT_TOOL) === true : true;
 +  const supported = eligible && capable;
 +  const consent = useHindsightConsentQuery(key, supported && !isNew);
 +  const mutation = useUpdateHindsightConsentMutation(key);
